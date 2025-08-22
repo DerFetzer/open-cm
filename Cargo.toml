@@ -1,0 +1,57 @@
+[package]
+authors = ["DerFetzer <kontakt@der-fetzer.de>"]
+name = "open-cm"
+edition = "2024"
+version = "0.1.0"
+
+
+[[bin]]
+name = "open-cm"
+test = false
+
+[lib]
+harness = false
+
+# needed for each integration test
+[[test]]
+name = "integration"
+harness = false
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt = "1.0"
+defmt-rtt = "1.0"
+heapless = { version = "0.9.1", features = ["defmt"] }
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+rtic = { version = "2.2.0", features = ["thumbv7-backend"] }
+rtic-monotonics = { version = "2.1.0", features = ["stm32h735ig", "stm32_tim2", "defmt"] }
+rtic-sync = "1.4.0"
+semihosting = "0.1.20"
+smoltcp = { version = "0.12.0", default-features = false, features = ["medium-ethernet", "defmt"] }
+stm32h7xx-hal = { git = "https://github.com/stm32-rs/stm32h7xx-hal", ref = "bcb9248c003f3670e5a8c9e19cb54b823bec10ff", features = ["stm32h735", "rt", "can", "ethernet"] }
+tecmp-rs = { path = "../tecmp-rs" }
+
+[dev-dependencies]
+defmt-test = "0.4.0"
+
+# cargo build/run
+[profile.dev]
+# default is opt-level = '0', but that makes very
+# verbose machine code
+opt-level = 's'
+# trade compile speed for slightly better optimisations
+codegen-units = 1
+
+# cargo build/run --release
+[profile.release]
+# default is opt-level = '3', but that makes quite
+# verbose machine code
+opt-level = 's'
+# trade compile speed for slightly better optimisations
+codegen-units = 1
+# Use Link Time Optimisations to further inline things across
+# crates
+lto = 'fat'
+# Leave the debug symbols in (default is no debug info)
+debug = 2
