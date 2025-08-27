@@ -30,14 +30,11 @@ static mut DES_RING: MaybeUninit<ethernet::DesRing<4, 4>> = MaybeUninit::uninit(
 
 pub struct Net {
     ethdev: ethernet::EthernetDMA<4, 4>,
-    tx_counter: u16,
 }
+
 impl Net {
     pub fn new(ethdev: ethernet::EthernetDMA<4, 4>) -> Self {
-        Net {
-            ethdev,
-            tx_counter: 0,
-        }
+        Net { ethdev }
     }
 
     pub fn poll(&mut self, now: u64) {
@@ -58,60 +55,61 @@ impl Net {
         //     .poll(timestamp, &mut self.ethdev, &mut self.sockets);
     }
 
-    pub fn transmit(&mut self, _buf: &[u8], now: u64) {
-        let timestamp = Instant::from_micros(now as i64);
-
-        if let Some(tx_token) = self.ethdev.transmit(timestamp) {
-            let tecmp = Tecmp {
-                header: TecmpGlobalHeader {
-                    device_id: 0x0001,
-                    counter: self.tx_counter,
-                    version: 3,
-                    message_type: MessageType::LoggingStream,
-                    data_type: DataType::Can,
-                    reserved: 0,
-                    device_flags: DeviceFlags {
-                        eos: false,
-                        sos: false,
-                        spy: false,
-                        multi_frame: false,
-                        device_overflow: false,
-                    },
-                },
-            };
-            let can_data = CanData {
-                flags: CanDataFlags::default(),
-                can_id: 0x100,
-                payload_length: 8,
-                payload: Vec::from_array([1, 2, 3, 4, 5, 6, 7, 8]),
-                crc: [0, 0],
-            };
-            let data_len = can_data.len();
-
-            let tecmp_data = TecmpData {
-                interface_id: 0x0001,
-                timestamp: now.saturating_mul(1000) & 0x3fffffffffffffff,
-                length: data_len as u16,
-                data: Data::Can(can_data),
-            };
-
-            let buf_len = max(64, tecmp.len() + tecmp_data.len());
-
-            tx_token.consume(buf_len, |buf| {
-                buf.fill(0);
-                let mut eth = EthernetFrame::new_unchecked(buf);
-                eth.set_dst_addr(EthernetAddress([0x01, 0x00, 0x5e, 0x00, 0x00, 0x00]));
-                eth.set_src_addr(EthernetAddress(MAC_ADDRESS));
-                eth.set_ethertype(EthernetProtocol::Unknown(0x99fe));
-                let payload = eth.payload_mut();
-                let data_offset = tecmp.to_slice(payload).unwrap();
-                let mut writer = Writer::new(Cursor::new(&mut payload[data_offset..]));
-                tecmp_data.to_writer(&mut writer, DataType::Can).unwrap();
-            });
-            self.tx_counter = self.tx_counter.wrapping_add(1);
+    pub fn transmit(&mut self, buf: &[u8]) {
+        if let Some(tx_token) = self.ethdev.transmit(Instant::from_micros_const(0)) {
+            tx_token.consume(buf.len(), |tx_buf| tx_buf.copy_from_slice(buf))
         } else {
             defmt::error!("Could not get tx token!");
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Default)]
+pub struct TecmpSender {
+    tx_counter: u16,
+}
+
+impl TecmpSender {
+    pub fn new() -> Self {
+        Self { tx_counter: 0 }
+    }
+
+    pub fn send(&mut self, data: &TecmpData, net: &mut Net) {
+        let tecmp = Tecmp {
+            header: TecmpGlobalHeader {
+                device_id: 0x0001,
+                counter: self.tx_counter,
+                version: 3,
+                message_type: MessageType::LoggingStream,
+                data_type: data.data.data_type(),
+                reserved: 0,
+                device_flags: DeviceFlags {
+                    eos: false,
+                    sos: false,
+                    spy: false,
+                    multi_frame: false,
+                    device_overflow: false,
+                },
+            },
+        };
+
+        let buf_len = max(64, tecmp.len() + data.len());
+
+        let buf = [0_u8; 1500];
+        let mut eth = EthernetFrame::new_unchecked(buf);
+
+        eth.set_dst_addr(EthernetAddress([0x01, 0x00, 0x5e, 0x00, 0x00, 0x00]));
+        eth.set_src_addr(EthernetAddress(MAC_ADDRESS));
+        eth.set_ethertype(EthernetProtocol::Unknown(0x99fe));
+
+        let payload = eth.payload_mut();
+        let data_offset = tecmp.to_slice(payload).unwrap();
+        let mut writer = Writer::new(Cursor::new(&mut payload[data_offset..]));
+        data.to_writer(&mut writer, data.data.data_type()).unwrap();
+
+        net.transmit(&buf[..buf_len]);
+
+        (self.tx_counter, _) = self.tx_counter.overflowing_add(1);
     }
 }
 
@@ -252,6 +250,5 @@ mod app {
 
         let time = Mono::now().duration_since_epoch().to_micros();
         ctx.local.net.poll(time);
-        ctx.local.net.transmit(&[], time);
     }
 }
