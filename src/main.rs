@@ -1,174 +1,25 @@
 #![no_main]
 #![no_std]
 
-use fdcan::config::FdCanConfig;
-use fdcan::{BusMonitoringMode, ConfigMode, FdCan, Instance, NormalOperationMode, PoweredDownMode};
-use open_cm as _;
-
-use smoltcp::wire::{EthernetAddress, EthernetFrame, EthernetProtocol};
-use tecmp_rs::deku::no_std_io::Cursor;
-use tecmp_rs::deku::writer::Writer;
-use tecmp_rs::deku::{DekuContainerWrite, DekuWriter};
-use tecmp_rs::{DeviceFlags, MessageType, Tecmp, TecmpData, TecmpGlobalHeader};
-
-use core::cmp::max;
 use core::mem::MaybeUninit;
 
-use smoltcp::phy::{Device, RxToken, TxToken};
-use smoltcp::time::Instant;
+use open_cm as _;
+use open_cm::tecmp::ED_NUM;
 
+use fdcan::Instance;
+use fdcan::config::FdCanConfig;
 use stm32h7xx_hal::ethernet;
-
-/// Locally administered MAC address
-const LOCAL_MAC_ADDRESS: EthernetAddress = EthernetAddress([0x02, 0x6f, 0xbd, 0x3d, 0x4a, 0x04]);
-/// Default TECMP multicast MAC address
-const TECMP_DST_MAC_ADDRESS: EthernetAddress =
-    EthernetAddress([0x01, 0x00, 0x5e, 0x00, 0x00, 0x00]);
-
-const TECMP_ETHERTYPE: EthernetProtocol = EthernetProtocol::Unknown(0x99fe);
-
-const ED_NUM: usize = 8;
 
 /// Ethernet descriptor rings are a global singleton
 #[unsafe(link_section = ".axisram.eth")]
 static mut DES_RING: MaybeUninit<ethernet::DesRing<ED_NUM, ED_NUM>> = MaybeUninit::uninit();
 
-pub struct TecmpHandler {
-    ethdev: ethernet::EthernetDMA<ED_NUM, ED_NUM>,
-    tx_counter: u16,
-}
-
-impl TecmpHandler {
-    pub fn new(ethdev: ethernet::EthernetDMA<ED_NUM, ED_NUM>) -> Self {
-        Self {
-            ethdev,
-            tx_counter: 0,
-        }
-    }
-
-    pub fn send(&mut self, data: &TecmpData) {
-        let tecmp = Tecmp {
-            header: TecmpGlobalHeader {
-                device_id: 0x0001,
-                counter: self.tx_counter,
-                version: 3,
-                message_type: MessageType::LoggingStream,
-                data_type: data.data.data_type(),
-                reserved: 0,
-                device_flags: DeviceFlags {
-                    eos: false,
-                    sos: false,
-                    spy: false,
-                    multi_frame: false,
-                    device_overflow: false,
-                },
-            },
-        };
-
-        let buf_len = max(
-            64,
-            EthernetFrame::<&[u8]>::header_len() + tecmp.len() + data.len(),
-        );
-
-        if let Some(tx_token) = self.ethdev.transmit(Instant::from_micros_const(0)) {
-            tx_token.consume(buf_len, |buf| {
-                buf.fill(0);
-
-                let mut eth = EthernetFrame::new_unchecked(buf);
-
-                eth.set_dst_addr(TECMP_DST_MAC_ADDRESS);
-                eth.set_src_addr(LOCAL_MAC_ADDRESS);
-                eth.set_ethertype(TECMP_ETHERTYPE);
-
-                let payload = eth.payload_mut();
-                let data_offset = tecmp.to_slice(payload).unwrap();
-                let mut writer = Writer::new(Cursor::new(&mut payload[data_offset..]));
-                data.to_writer(&mut writer, data.data.data_type()).unwrap();
-            })
-        } else {
-            defmt::error!("Could not get tx token!");
-        }
-
-        (self.tx_counter, _) = self.tx_counter.overflowing_add(1);
-    }
-
-    pub fn receive(&mut self) {
-        while let Some((rx_token, _)) = self.ethdev.receive(Instant::from_micros(0)) {
-            rx_token.consume(|buf| {
-                let eth = EthernetFrame::new_unchecked(buf);
-                defmt::debug!(
-                    "Received ethernet frame -> src: {}, dst: {}, ethertype: {}",
-                    eth.src_addr(),
-                    eth.dst_addr(),
-                    eth.ethertype()
-                );
-                if eth.ethertype() == TECMP_ETHERTYPE && eth.dst_addr() == LOCAL_MAC_ADDRESS {
-                    defmt::info!("Received TECMP message for this device");
-                }
-            })
-        }
-    }
-}
-
-#[derive(Default)]
-pub enum CanStateWrapper<I: Instance> {
-    PoweredDown(FdCan<I, PoweredDownMode>),
-    Config(FdCan<I, ConfigMode>),
-    BusMonitoring(FdCan<I, BusMonitoringMode>),
-    NormalOperation(FdCan<I, NormalOperationMode>),
-    #[default]
-    Dummy,
-}
-
-impl<I: Instance> CanStateWrapper<I> {
-    pub fn enable(self, config: FdCanConfig, monitoring: bool) -> Self {
-        match self {
-            CanStateWrapper::PoweredDown(fd_can) => {
-                let fd_can = fd_can.into_config_mode();
-                if !monitoring {
-                    Self::NormalOperation(fd_can.into_normal())
-                } else {
-                    Self::BusMonitoring(fd_can.into_bus_monitoring())
-                }
-            }
-            CanStateWrapper::Config(mut fd_can) => {
-                fd_can.apply_config(config);
-                if !monitoring {
-                    Self::NormalOperation(fd_can.into_normal())
-                } else {
-                    Self::BusMonitoring(fd_can.into_bus_monitoring())
-                }
-            }
-            CanStateWrapper::BusMonitoring(_) | CanStateWrapper::NormalOperation(_) => {
-                defmt::warn!("Already enabled");
-                self
-            }
-            CanStateWrapper::Dummy => {
-                defmt::error!("Cannot enable dummy");
-                self
-            }
-        }
-    }
-
-    pub fn disable(self) -> Self {
-        match self {
-            CanStateWrapper::BusMonitoring(fd_can) => Self::Config(fd_can.into_config_mode()),
-            CanStateWrapper::NormalOperation(fd_can) => Self::Config(fd_can.into_config_mode()),
-            CanStateWrapper::PoweredDown(_) | CanStateWrapper::Config(_) => {
-                defmt::warn!("Already disabled");
-                self
-            }
-            CanStateWrapper::Dummy => {
-                defmt::error!("Cannot enable dummy");
-                self
-            }
-        }
-    }
-}
-
 #[rtic::app(device = stm32h7xx_hal::stm32, peripherals = true, dispatchers = [EXTI0, EXTI1])]
 mod app {
     use fdcan::config::{Interrupt, Interrupts};
+    use open_cm::can::CanStateWrapper;
+    use open_cm::tecmp::LOCAL_MAC_ADDRESS;
+    use open_cm::tecmp::TecmpHandler;
     use rtic_monotonics::stm32::prelude::*;
     use stm32h7xx_hal::{
         can::Can,
