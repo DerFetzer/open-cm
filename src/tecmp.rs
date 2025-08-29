@@ -23,6 +23,9 @@ pub const TECMP_ETHERTYPE: EthernetProtocol = EthernetProtocol::Unknown(0x99fe);
 
 pub const ED_NUM: usize = 8;
 
+#[derive(Debug, Copy, Clone, defmt::Format)]
+pub struct InterfaceId(pub u32);
+
 pub struct TecmpHandler {
     ethdev: ethernet::EthernetDMA<ED_NUM, ED_NUM>,
     tx_counter: u16,
