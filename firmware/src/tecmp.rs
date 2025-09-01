@@ -94,14 +94,14 @@ impl TecmpHandler {
         while let Some((rx_token, _)) = self.ethdev.receive(Instant::from_micros(0)) {
             rx_token.consume(|buf| {
                 let eth = EthernetFrame::new_unchecked(buf);
-                defmt::debug!(
+                defmt::trace!(
                     "Received ethernet frame -> src: {}, dst: {}, ethertype: {}",
                     eth.src_addr(),
                     eth.dst_addr(),
                     eth.ethertype()
                 );
-                if eth.ethertype() == TECMP_ETHERTYPE && eth.dst_addr() == LOCAL_MAC_ADDRESS {
-                    defmt::info!("Received TECMP message for this device");
+                if eth.ethertype() == TECMP_ETHERTYPE {
+                    defmt::info!("Received TECMP message (len={})", buf.len());
                     match Tecmp::from_bytes((eth.payload(), 0)) {
                         Ok(((buf, _), tecmp)) => {
                             if tecmp.header.message_type == MessageType::ReplayData
