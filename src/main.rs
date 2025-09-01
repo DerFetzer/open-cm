@@ -16,14 +16,12 @@ static mut DES_RING: MaybeUninit<ethernet::DesRing<ED_NUM, ED_NUM>> = MaybeUnini
 #[rtic::app(device = stm32h7xx_hal::stm32, peripherals = true, dispatchers = [EXTI0, EXTI1])]
 mod app {
     use fdcan::config::{Interrupt, Interrupts};
-    use fdcan::frame::{FrameFormat, TxFrameHeader};
-    use fdcan::id::{Id, StandardId};
     use heapless::Vec;
-    use open_cm::can::CanStateWrapper;
+    use open_cm::can::CanHandler;
     use open_cm::can::Fifo;
-    use open_cm::tecmp::InterfaceId;
     use open_cm::tecmp::LOCAL_MAC_ADDRESS;
     use open_cm::tecmp::TecmpHandler;
+    use open_cm::tecmp::{InterfaceId, TECMP_CHANNEL_SIZE};
     use rtic_monotonics::stm32::prelude::*;
     use rtic_sync::channel::Receiver;
     use rtic_sync::channel::Sender;
@@ -43,13 +41,11 @@ mod app {
 
     use super::*;
 
-    const TECMP_CHANNEL_SIZE: usize = 10;
-
     #[shared]
     struct SharedResources {
         tecmp_handler: TecmpHandler,
-        can1: CanStateWrapper<Can<FDCAN1>>,
-        can2: CanStateWrapper<Can<FDCAN2>>,
+        can1: CanHandler<Can<FDCAN1>>,
+        can2: CanHandler<Can<FDCAN2>>,
     }
     #[local]
     struct LocalResources {
@@ -57,6 +53,7 @@ mod app {
         link_led: gpio::gpioc::PC3<gpio::Output<gpio::PushPull>>,
         tecmp_sender_can1: Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
         tecmp_sender_can2: Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
+        tecmp_data_sender: Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
     }
 
     stm32_tim2_monotonic!(Mono, 1_000_000);
@@ -176,28 +173,28 @@ mod app {
 
         // Channels
         let (tecmp_s, tecmp_r) = make_channel!(TecmpData, TECMP_CHANNEL_SIZE);
+        let (tecmp_data_s, tecmp_data_r) = make_channel!(TecmpData, TECMP_CHANNEL_SIZE);
 
         // Spawn tasks
         tecmp_sender::spawn(tecmp_r).unwrap();
+        tecmp_data_dispatcher::spawn(tecmp_data_r).unwrap();
         can1_enable::spawn().unwrap();
         can2_enable::spawn().unwrap();
-
-        can1_send_loop::spawn().unwrap();
-        can2_send_loop::spawn().unwrap();
 
         Mono::start(200_000_000);
 
         (
             SharedResources {
                 tecmp_handler,
-                can1: CanStateWrapper::new(can1, Fifo::Fifo0),
-                can2: CanStateWrapper::new(can2, Fifo::Fifo1),
+                can1: CanHandler::new(can1, Fifo::Fifo0, InterfaceId(0x1)),
+                can2: CanHandler::new(can2, Fifo::Fifo1, InterfaceId(0x2)),
             },
             LocalResources {
                 lan8742a,
                 link_led,
                 tecmp_sender_can1: tecmp_s.clone(),
                 tecmp_sender_can2: tecmp_s,
+                tecmp_data_sender: tecmp_data_s,
             },
         )
     }
@@ -213,100 +210,42 @@ mod app {
         }
     }
 
-    // Test tasks
-    #[task(priority = 1, shared = [can1])]
-    async fn can1_send_loop(mut ctx: can1_send_loop::Context) {
-        let mut last_send_instant = Mono::now();
-        loop {
-            let next_send_instant = last_send_instant + 2_u64.secs();
-            Mono::delay_until(next_send_instant).await;
-            last_send_instant = next_send_instant;
-
-            defmt::info!("Send message on CAN1");
-            ctx.shared.can1.lock(|can| {
-                if !can.transmit(
-                    TxFrameHeader {
-                        len: 8,
-                        frame_format: FrameFormat::Standard,
-                        id: Id::Standard(StandardId::new(0x100).unwrap()),
-                        bit_rate_switching: false,
-                        marker: None,
-                    },
-                    &[0xaa; 8],
-                ) {
-                    defmt::warn!("Could not send CAN message");
-                }
-            })
-        }
-    }
-
-    #[task(priority = 1, shared = [can2])]
-    async fn can2_send_loop(mut ctx: can2_send_loop::Context) {
-        Mono::delay(100_u64.millis()).await;
-        let mut last_send_instant = Mono::now();
-        loop {
-            let next_send_instant = last_send_instant + 2_u64.secs();
-            Mono::delay_until(next_send_instant).await;
-            last_send_instant = next_send_instant;
-
-            defmt::info!("Send message on CAN2");
-            ctx.shared.can2.lock(|can| {
-                if !can.transmit(
-                    TxFrameHeader {
-                        len: 8,
-                        frame_format: FrameFormat::Standard,
-                        id: Id::Standard(StandardId::new(0x100).unwrap()),
-                        bit_rate_switching: false,
-                        marker: None,
-                    },
-                    &[0xaa; 8],
-                ) {
-                    defmt::warn!("Could not send CAN message");
-                }
-            })
-        }
-    }
-
     // CAN tasks
     #[task(priority = 2, shared = [can1])]
     async fn can1_enable(mut ctx: can1_enable::Context) {
         ctx.shared.can1.lock(|can| {
-            let wrapper = core::mem::take(can);
-            core::mem::replace(can, wrapper.enable(false))
+            can.enable(false);
         });
     }
 
     #[task(priority = 2, shared = [can2])]
     async fn can2_enable(mut ctx: can2_enable::Context) {
         ctx.shared.can2.lock(|can| {
-            let wrapper = core::mem::take(can);
-            core::mem::replace(can, wrapper.enable(false))
+            can.enable(false);
         });
     }
 
     #[task(priority = 2, shared = [can1])]
     async fn can1_disable(mut ctx: can1_disable::Context) {
         ctx.shared.can1.lock(|can| {
-            let wrapper = core::mem::take(can);
-            core::mem::replace(can, wrapper.disable())
+            can.disable();
         });
     }
 
     #[task(priority = 2, shared = [can2])]
     async fn can2_disable(mut ctx: can2_disable::Context) {
         ctx.shared.can2.lock(|can| {
-            let wrapper = core::mem::take(can);
-            core::mem::replace(can, wrapper.disable())
+            can.disable();
         });
     }
 
-    #[task(binds = ETH, shared = [tecmp_handler], priority = 3)]
+    #[task(binds = ETH, shared = [tecmp_handler], local = [tecmp_data_sender], priority = 3)]
     fn ethernet_event(mut ctx: ethernet_event::Context) {
         unsafe { ethernet::interrupt_handler() }
 
         ctx.shared
             .tecmp_handler
-            .lock(|tecmp_handler| tecmp_handler.receive());
+            .lock(|tecmp_handler| tecmp_handler.receive(ctx.local.tecmp_data_sender));
     }
 
     #[task(shared = [tecmp_handler], priority = 1)]
@@ -315,27 +254,45 @@ mod app {
         mut receiver: Receiver<'static, TecmpData, TECMP_CHANNEL_SIZE>,
     ) {
         while let Ok(data) = receiver.recv().await {
-            defmt::info!("Got tecmp data");
+            defmt::info!("Sender: got tecmp data");
             ctx.shared.tecmp_handler.lock(|handler| handler.send(&data));
         }
     }
 
+    #[task(shared = [can1, can2], priority = 1)]
+    async fn tecmp_data_dispatcher(
+        mut ctx: tecmp_data_dispatcher::Context,
+        mut receiver: Receiver<'static, TecmpData, TECMP_CHANNEL_SIZE>,
+    ) {
+        while let Ok(data) = receiver.recv().await {
+            defmt::info!("Receiver: got tecmp data");
+            ctx.shared.can1.lock(|can| {
+                if can.interface_id.0 == data.interface_id && !can.transmit_tecmp_data(&data) {
+                    defmt::error!("Could not send can data for interface {}", can.interface_id);
+                }
+            });
+            ctx.shared.can2.lock(|can| {
+                if can.interface_id.0 == data.interface_id && !can.transmit_tecmp_data(&data) {
+                    defmt::error!("Could not send can data for interface {}", can.interface_id);
+                }
+            });
+        }
+    }
+
     fn handle_can_event<I: Instance>(
-        can: &mut CanStateWrapper<I>,
-        fifo: Fifo,
-        id: InterfaceId,
+        can: &mut CanHandler<I>,
         tecmp_s: &mut Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
     ) {
-        let interrupt = match fifo {
+        let interrupt = match can.fifo {
             Fifo::Fifo0 => Interrupt::RxFifo0NewMsg,
             Fifo::Fifo1 => Interrupt::RxFifo1NewMsg,
         };
         if can.has_interrupt(interrupt) {
-            defmt::info!("{} has new message(s)", id);
+            defmt::info!("{} has new message(s)", can.interface_id);
             let mut buf = [0; 64];
-            while let Some(header) = can.receive(&mut buf, fifo) {
+            while let Some(header) = can.receive(&mut buf) {
                 let mut tecmp_data = TecmpData {
-                    interface_id: id.0,
+                    interface_id: can.interface_id.0,
                     timestamp: Mono::now().ticks() * 1000,
                     length: 0, // Set later
                     data: match header.frame_format {
@@ -394,7 +351,7 @@ mod app {
         let tecmp_sender = ctx.local.tecmp_sender_can1;
         ctx.shared
             .can1
-            .lock(|can1| handle_can_event(can1, Fifo::Fifo0, InterfaceId(1), tecmp_sender));
+            .lock(|can1| handle_can_event(can1, tecmp_sender));
     }
 
     #[task(binds = FDCAN2_IT0, shared = [can2], local = [tecmp_sender_can2], priority = 3)]
@@ -403,6 +360,6 @@ mod app {
         let tecmp_sender = ctx.local.tecmp_sender_can2;
         ctx.shared
             .can2
-            .lock(|can2| handle_can_event(can2, Fifo::Fifo1, InterfaceId(2), tecmp_sender));
+            .lock(|can2| handle_can_event(can2, tecmp_sender));
     }
 }

@@ -1,12 +1,16 @@
 use core::cmp::max;
 
+use rtic_sync::channel::Sender;
 use smoltcp::{
     phy::{Device, RxToken, TxToken},
     time::Instant,
     wire::{EthernetAddress, EthernetFrame, EthernetProtocol},
 };
 use stm32h7xx_hal::ethernet;
-use tecmp_rs::deku::DekuContainerWrite;
+use tecmp_rs::{
+    DataType,
+    deku::{DekuContainerRead, DekuContainerWrite, DekuReader as _, reader::Reader},
+};
 use tecmp_rs::{
     DeviceFlags, MessageType, Tecmp, TecmpData, TecmpGlobalHeader,
     deku::{DekuWriter as _, no_std_io::Cursor, writer::Writer},
@@ -22,6 +26,7 @@ pub const TECMP_DST_MAC_ADDRESS: EthernetAddress =
 pub const TECMP_ETHERTYPE: EthernetProtocol = EthernetProtocol::Unknown(0x99fe);
 
 pub const ED_NUM: usize = 8;
+pub const TECMP_CHANNEL_SIZE: usize = 10;
 
 #[derive(Debug, Copy, Clone, defmt::Format)]
 pub struct InterfaceId(pub u32);
@@ -85,7 +90,7 @@ impl TecmpHandler {
         (self.tx_counter, _) = self.tx_counter.overflowing_add(1);
     }
 
-    pub fn receive(&mut self) {
+    pub fn receive(&mut self, sender: &mut Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>) {
         while let Some((rx_token, _)) = self.ethdev.receive(Instant::from_micros(0)) {
             rx_token.consume(|buf| {
                 let eth = EthernetFrame::new_unchecked(buf);
@@ -97,6 +102,36 @@ impl TecmpHandler {
                 );
                 if eth.ethertype() == TECMP_ETHERTYPE && eth.dst_addr() == LOCAL_MAC_ADDRESS {
                     defmt::info!("Received TECMP message for this device");
+                    match Tecmp::from_bytes((eth.payload(), 0)) {
+                        Ok(((buf, _), tecmp)) => {
+                            if tecmp.header.message_type == MessageType::ReplayData
+                                && (tecmp.header.data_type == DataType::Can
+                                    || tecmp.header.data_type == DataType::CanFd)
+                            {
+                                let mut reader = Reader::new(Cursor::new(buf));
+                                match TecmpData::from_reader_with_ctx(
+                                    &mut reader,
+                                    tecmp.header.data_type,
+                                ) {
+                                    Ok(tecmp_data) => {
+                                        if sender.try_send(tecmp_data).is_err() {
+                                            defmt::error!("Could not send tecmp data");
+                                        }
+                                    }
+                                    Err(e) => defmt::error!(
+                                        "Could not parse tecmp data: {}",
+                                        defmt::Display2Format(&e)
+                                    ),
+                                }
+                            } else {
+                                defmt::info!("Ignore tecmp message due to message or data type");
+                            }
+                        }
+                        Err(e) => defmt::error!(
+                            "Could not parse ethernet payload as tecmp: {}",
+                            defmt::Display2Format(&e)
+                        ),
+                    }
                 }
             })
         }

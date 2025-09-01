@@ -2,8 +2,18 @@ use fdcan::{
     BusMonitoringMode, ConfigMode, FdCan, Instance, NormalOperationMode, PoweredDownMode,
     config::{FrameTransmissionConfig, Interrupt, InterruptLine, Interrupts},
     filter::{ExtendedFilter, StandardFilter},
-    frame::{RxFrameInfo, TxFrameHeader},
+    frame::{FrameFormat, RxFrameInfo, TxFrameHeader},
+    id::{ExtendedId, Id, StandardId},
 };
+use tecmp_rs::TecmpData;
+
+use crate::tecmp::InterfaceId;
+
+pub struct CanHandler<I: Instance> {
+    state_wrapper: CanStateWrapper<I>,
+    pub fifo: Fifo,
+    pub interface_id: InterfaceId,
+}
 
 #[derive(Default)]
 pub enum CanStateWrapper<I: Instance> {
@@ -21,8 +31,8 @@ pub enum Fifo {
     Fifo1,
 }
 
-impl<I: Instance> CanStateWrapper<I> {
-    pub fn new(mut can: FdCan<I, ConfigMode>, fifo: Fifo) -> Self {
+impl<I: Instance> CanHandler<I> {
+    pub fn new(mut can: FdCan<I, ConfigMode>, fifo: Fifo, interface_id: InterfaceId) -> Self {
         match fifo {
             Fifo::Fifo0 => {
                 can.set_standard_filter(
@@ -51,8 +61,145 @@ impl<I: Instance> CanStateWrapper<I> {
         can.enable_interrupt_line(InterruptLine::_0, true);
         can.enable_interrupts(Interrupts::all());
 
-        Self::Config(can)
+        Self {
+            state_wrapper: CanStateWrapper::Config(can),
+            fifo,
+            interface_id,
+        }
     }
+
+    pub fn enable(&mut self, monitoring: bool) {
+        let state_wrapper = core::mem::take(&mut self.state_wrapper);
+        self.state_wrapper = state_wrapper.enable(monitoring);
+    }
+
+    pub fn disable(&mut self) {
+        let state_wrapper = core::mem::take(&mut self.state_wrapper);
+        self.state_wrapper = state_wrapper.disable();
+    }
+
+    pub fn transmit(&mut self, header: TxFrameHeader, buf: &[u8]) -> bool {
+        match &mut self.state_wrapper {
+            CanStateWrapper::NormalOperation(fd_can) => fd_can.transmit(header, buf).is_ok(),
+            CanStateWrapper::Config(_)
+            | CanStateWrapper::PoweredDown(_)
+            | CanStateWrapper::BusMonitoring(_) => {
+                defmt::warn!("Cannot send in passive modes");
+                false
+            }
+            CanStateWrapper::Dummy => {
+                defmt::error!("Cannot send in dummy state");
+                false
+            }
+        }
+    }
+
+    pub fn transmit_tecmp_data(&mut self, data: &TecmpData) -> bool {
+        if data.interface_id != self.interface_id.0 {
+            defmt::warn!(
+                "Tecmp data not for interface {} but {}",
+                data.interface_id,
+                self.interface_id.0
+            );
+            return false;
+        }
+
+        let (header, buf) = match &data.data {
+            tecmp_rs::Data::Can(can_data) => (
+                TxFrameHeader {
+                    len: can_data.payload_length,
+                    frame_format: FrameFormat::Standard,
+                    id: if can_data.flags.ide || can_data.can_id & (1 << 31) != 0 {
+                        Id::Extended(unsafe {
+                            ExtendedId::new_unchecked(can_data.can_id & 0x3FFF_FFFF)
+                        })
+                    } else {
+                        Id::Standard(unsafe {
+                            StandardId::new_unchecked(can_data.can_id as u16 & 0x7FF)
+                        })
+                    },
+                    bit_rate_switching: false,
+                    marker: None,
+                },
+                can_data.payload.as_slice(),
+            ),
+            tecmp_rs::Data::CanFd(can_fd_data) => (
+                TxFrameHeader {
+                    len: can_fd_data.payload_length,
+                    frame_format: FrameFormat::Standard,
+                    id: if can_fd_data.flags.ide || can_fd_data.can_id & (1 << 31) != 0 {
+                        Id::Extended(unsafe {
+                            ExtendedId::new_unchecked(can_fd_data.can_id & 0x3FFF_FFFF)
+                        })
+                    } else {
+                        Id::Standard(unsafe {
+                            StandardId::new_unchecked(can_fd_data.can_id as u16 & 0x7FF)
+                        })
+                    },
+                    bit_rate_switching: can_fd_data.flags.brs,
+                    marker: None,
+                },
+                can_fd_data.payload.as_slice(),
+            ),
+        };
+        self.transmit(header, buf)
+    }
+
+    pub fn receive(&mut self, buf: &mut [u8]) -> Option<RxFrameInfo> {
+        match &mut self.state_wrapper {
+            CanStateWrapper::BusMonitoring(fd_can) => match match self.fifo {
+                Fifo::Fifo0 => fd_can.receive0(buf),
+                Fifo::Fifo1 => fd_can.receive1(buf),
+            } {
+                Ok(or) => Some(or.unwrap()),
+                Err(_) => None,
+            },
+            CanStateWrapper::NormalOperation(fd_can) => match match self.fifo {
+                Fifo::Fifo0 => fd_can.receive0(buf),
+                Fifo::Fifo1 => fd_can.receive1(buf),
+            } {
+                Ok(or) => Some(or.unwrap()),
+                Err(_) => None,
+            },
+
+            CanStateWrapper::Config(_) | CanStateWrapper::PoweredDown(_) => {
+                defmt::warn!("Cannot send in passive modes");
+                None
+            }
+            CanStateWrapper::Dummy => {
+                defmt::error!("Cannot send in dummy state");
+                None
+            }
+        }
+    }
+
+    pub fn has_interrupt(&mut self, interrupt: Interrupt) -> bool {
+        match &mut self.state_wrapper {
+            CanStateWrapper::PoweredDown(fd_can) => fd_can.has_interrupt(interrupt),
+            CanStateWrapper::Config(fd_can) => fd_can.has_interrupt(interrupt),
+            CanStateWrapper::BusMonitoring(fd_can) => fd_can.has_interrupt(interrupt),
+            CanStateWrapper::NormalOperation(fd_can) => fd_can.has_interrupt(interrupt),
+            CanStateWrapper::Dummy => {
+                defmt::error!("Cannot send in dummy state");
+                false
+            }
+        }
+    }
+
+    pub fn clear_interrupts(&mut self, interrupts: Interrupts) {
+        match &mut self.state_wrapper {
+            CanStateWrapper::PoweredDown(fd_can) => fd_can.clear_interrupts(interrupts),
+            CanStateWrapper::Config(fd_can) => fd_can.clear_interrupts(interrupts),
+            CanStateWrapper::BusMonitoring(fd_can) => fd_can.clear_interrupts(interrupts),
+            CanStateWrapper::NormalOperation(fd_can) => fd_can.clear_interrupts(interrupts),
+            CanStateWrapper::Dummy => {
+                defmt::error!("Cannot send in dummy state");
+            }
+        }
+    }
+}
+
+impl<I: Instance> CanStateWrapper<I> {
     pub fn enable(self, monitoring: bool) -> Self {
         match self {
             CanStateWrapper::PoweredDown(fd_can) => {
