@@ -8,8 +8,8 @@ use smoltcp::{
 };
 use stm32h7xx_hal::ethernet;
 use tecmp_rs::{
-    DataType,
-    deku::{DekuContainerRead, DekuContainerWrite, DekuReader as _, reader::Reader},
+    DataIterator, DataType,
+    deku::{DekuContainerRead, DekuContainerWrite},
 };
 use tecmp_rs::{
     DeviceFlags, MessageType, Tecmp, TecmpData, TecmpGlobalHeader,
@@ -108,20 +108,13 @@ impl TecmpHandler {
                                 && (tecmp.header.data_type == DataType::Can
                                     || tecmp.header.data_type == DataType::CanFd)
                             {
-                                let mut reader = Reader::new(Cursor::new(buf));
-                                match TecmpData::from_reader_with_ctx(
-                                    &mut reader,
-                                    tecmp.header.data_type,
-                                ) {
-                                    Ok(tecmp_data) => {
-                                        if sender.try_send(tecmp_data).is_err() {
-                                            defmt::error!("Could not send tecmp data");
-                                        }
+                                let data_iterator = DataIterator::new(buf, tecmp.header.data_type);
+                                for tecmp_data in data_iterator {
+                                    defmt::info!("Got tecmp data: {:?}", tecmp_data);
+
+                                    if sender.try_send(tecmp_data).is_err() {
+                                        defmt::error!("Could not send tecmp data");
                                     }
-                                    Err(e) => defmt::error!(
-                                        "Could not parse tecmp data: {}",
-                                        defmt::Display2Format(&e)
-                                    ),
                                 }
                             } else {
                                 defmt::info!("Ignore tecmp message due to message or data type");
