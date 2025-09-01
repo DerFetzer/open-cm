@@ -6,7 +6,7 @@ use smoltcp::wire::{EthernetAddress, EthernetFrame, EthernetProtocol};
 use tecmp_rs::{CanData, CanDataFlags, DataType, deku::DekuContainerWrite};
 use tecmp_rs::{
     MessageType, Tecmp, TecmpData, TecmpGlobalHeader,
-    deku::{DekuWriter as _, no_std_io::Cursor, writer::Writer},
+    deku::{DekuUpdate as _, DekuWriter as _, no_std_io::Cursor, writer::Writer},
 };
 
 /// Locally administered MAC address
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             crc: [0; 2],
         }),
     };
-    data.length = data.len() as u16;
+    data.update()?;
 
     let data_offset = tecmp.to_slice(payload).unwrap();
     let mut writer = Writer::new(Cursor::new(&mut payload[data_offset..]));
