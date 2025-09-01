@@ -37,6 +37,7 @@ mod app {
             rec::{Fdcan, FdcanClkSel},
         },
     };
+    use tecmp_rs::deku::DekuUpdate as _;
     use tecmp_rs::{CanDataFlags, CanFdDataFlags, TecmpData};
 
     use super::*;
@@ -336,7 +337,7 @@ mod app {
                         }
                     },
                 };
-                tecmp_data.length = tecmp_data.len() as u16;
+                tecmp_data.update().unwrap();
                 if tecmp_s.try_send(tecmp_data).is_err() {
                     defmt::warn!("Could not send tecmp data to channel");
                 }
