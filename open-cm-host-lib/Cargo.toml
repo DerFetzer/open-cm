@@ -1,11 +1,11 @@
 [package]
-name = "send_can"
+name = "open-cm-host-lib"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-open-cm-common = { path = "../../open-cm-common", features = ["std"] }
-tecmp-rs = { path = "../../../tecmp-rs", features = ["std"] }
+open-cm-common = { path = "../open-cm-common", features = ["std"] }
+tecmp-rs = { path = "../../tecmp-rs", features = ["std"] }
 pcap = "2.3.0"
 clap = { version = "4.5.46", features = ["derive"] }
 smoltcp = "0.12.0"
