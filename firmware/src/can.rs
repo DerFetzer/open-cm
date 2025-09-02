@@ -1,6 +1,11 @@
+use core::num::{NonZeroU8, NonZeroU16};
+
 use fdcan::{
     BusMonitoringMode, ConfigMode, FdCan, Instance, NormalOperationMode, PoweredDownMode,
-    config::{FrameTransmissionConfig, Interrupt, InterruptLine, Interrupts},
+    config::{
+        DataBitTiming, FrameTransmissionConfig, Interrupt, InterruptLine, Interrupts,
+        NominalBitTiming,
+    },
     filter::{ExtendedFilter, StandardFilter},
     frame::{FrameFormat, RxFrameInfo, TxFrameHeader},
     id::{ExtendedId, Id, StandardId},
@@ -29,6 +34,26 @@ pub enum CanStateWrapper<I: Instance> {
 pub enum Fifo {
     Fifo0,
     Fifo1,
+}
+
+#[derive(Debug, Clone, Copy, defmt::Format, serde::Serialize, serde::Deserialize)]
+pub struct CanBitTiming {
+    pub prescaler: NonZeroU16,
+    pub seg1: NonZeroU8,
+    pub seg2: NonZeroU8,
+    pub sync_jump_width: NonZeroU8,
+}
+
+#[derive(Debug, Clone, Copy, defmt::Format, serde::Serialize, serde::Deserialize)]
+pub struct CanChannelConfig {
+    pub interface_id: InterfaceId,
+    pub enabled: bool,
+    pub monitoring: bool,
+    pub nominal_bit_timing: CanBitTiming,
+    pub data_bit_timing: CanBitTiming,
+    pub transceiver_delay_compensation: bool,
+    pub automatic_retransmit: bool,
+    pub protocol_exception_handling: bool,
 }
 
 impl<I: Instance> CanHandler<I> {
@@ -76,6 +101,12 @@ impl<I: Instance> CanHandler<I> {
     pub fn disable(&mut self) {
         let state_wrapper = core::mem::take(&mut self.state_wrapper);
         self.state_wrapper = state_wrapper.disable();
+    }
+
+    pub fn configure(&mut self, config: CanChannelConfig) {
+        self.disable();
+        let state_wrapper = core::mem::take(&mut self.state_wrapper);
+        self.state_wrapper = state_wrapper.configure(config);
     }
 
     pub fn transmit(&mut self, header: TxFrameHeader, buf: &[u8]) -> bool {
@@ -141,6 +172,7 @@ impl<I: Instance> CanHandler<I> {
                 },
                 can_fd_data.payload.as_slice(),
             ),
+            _ => return false,
         };
         self.transmit(header, buf)
     }
@@ -233,6 +265,47 @@ impl<I: Instance> CanStateWrapper<I> {
             CanStateWrapper::BusMonitoring(fd_can) => Self::Config(fd_can.into_config_mode()),
             CanStateWrapper::NormalOperation(fd_can) => Self::Config(fd_can.into_config_mode()),
             CanStateWrapper::PoweredDown(_) | CanStateWrapper::Config(_) => {
+                defmt::warn!("Already disabled");
+                self
+            }
+            CanStateWrapper::Dummy => {
+                defmt::error!("Cannot enable dummy");
+                self
+            }
+        }
+    }
+
+    pub fn configure(self, config: CanChannelConfig) -> Self {
+        match self {
+            CanStateWrapper::Config(mut fd_can) => {
+                fd_can.set_nominal_bit_timing(NominalBitTiming {
+                    prescaler: config.nominal_bit_timing.prescaler,
+                    seg1: config.nominal_bit_timing.seg1,
+                    seg2: config.nominal_bit_timing.seg2,
+                    sync_jump_width: config.nominal_bit_timing.sync_jump_width,
+                });
+                fd_can.set_data_bit_timing(DataBitTiming {
+                    transceiver_delay_compensation: config.transceiver_delay_compensation,
+                    prescaler: NonZeroU8::new(
+                        (config.data_bit_timing.prescaler.get() & 0xFF) as u8,
+                    )
+                    .unwrap(),
+                    seg1: config.data_bit_timing.seg1,
+                    seg2: config.data_bit_timing.seg2,
+                    sync_jump_width: config.nominal_bit_timing.sync_jump_width,
+                });
+                fd_can.set_automatic_retransmit(config.automatic_retransmit);
+                fd_can.set_protocol_exception_handling(config.protocol_exception_handling);
+
+                if config.enabled {
+                    CanStateWrapper::Config(fd_can).enable(config.monitoring)
+                } else {
+                    CanStateWrapper::Config(fd_can)
+                }
+            }
+            CanStateWrapper::PoweredDown(_)
+            | CanStateWrapper::BusMonitoring(_)
+            | CanStateWrapper::NormalOperation(_) => {
                 defmt::warn!("Already disabled");
                 self
             }

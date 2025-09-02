@@ -29,6 +29,8 @@ rtic = { version = "2.2.0", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "2.1.0", features = ["stm32h735ig", "stm32_tim2", "defmt"] }
 rtic-sync = "1.4.0"
 semihosting = "0.1.20"
+serde = { version = "1.0.219", default-features = false, features = ["derive"] }
+serde-json-core = { version = "0.6.0", features = ["defmt", "heapless"] }
 smoltcp = { version = "0.12.0", default-features = false, features = ["medium-ethernet", "defmt"] }
 stm32h7xx-hal = { git = "https://github.com/stm32-rs/stm32h7xx-hal", rev = "bcb9248c003f3670e5a8c9e19cb54b823bec10ff", features = ["stm32h735", "rt", "can", "ethernet"] }
 tecmp-rs = { path = "../../tecmp-rs", features = ["defmt"] }

@@ -6,7 +6,6 @@ use core::mem::MaybeUninit;
 use open_cm as _;
 use open_cm::tecmp::ED_NUM;
 
-use fdcan::Instance;
 use stm32h7xx_hal::ethernet;
 
 /// Ethernet descriptor rings are a global singleton
@@ -15,13 +14,15 @@ static mut DES_RING: MaybeUninit<ethernet::DesRing<ED_NUM, ED_NUM>> = MaybeUnini
 
 #[rtic::app(device = stm32h7xx_hal::stm32, peripherals = true, dispatchers = [EXTI0, EXTI1])]
 mod app {
+    use fdcan::Instance;
     use fdcan::config::{Interrupt, Interrupts};
     use heapless::Vec;
     use open_cm::can::CanHandler;
     use open_cm::can::Fifo;
-    use open_cm::tecmp::LOCAL_MAC_ADDRESS;
+    use open_cm::tecmp::TecmpEvent;
     use open_cm::tecmp::TecmpHandler;
     use open_cm::tecmp::{InterfaceId, TECMP_CHANNEL_SIZE};
+    use open_cm::tecmp::{LOCAL_MAC_ADDRESS, TecmpConfig};
     use rtic_monotonics::stm32::prelude::*;
     use rtic_sync::channel::Receiver;
     use rtic_sync::channel::Sender;
@@ -54,7 +55,7 @@ mod app {
         link_led: gpio::gpioc::PC3<gpio::Output<gpio::PushPull>>,
         tecmp_sender_can1: Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
         tecmp_sender_can2: Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
-        tecmp_data_sender: Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
+        tecmp_event_sender: Sender<'static, TecmpEvent, TECMP_CHANNEL_SIZE>,
     }
 
     stm32_tim2_monotonic!(Mono, 1_000_000);
@@ -174,13 +175,11 @@ mod app {
 
         // Channels
         let (tecmp_s, tecmp_r) = make_channel!(TecmpData, TECMP_CHANNEL_SIZE);
-        let (tecmp_data_s, tecmp_data_r) = make_channel!(TecmpData, TECMP_CHANNEL_SIZE);
+        let (tecmp_event_s, tecmp_event_r) = make_channel!(TecmpEvent, TECMP_CHANNEL_SIZE);
 
         // Spawn tasks
         tecmp_sender::spawn(tecmp_r).unwrap();
-        tecmp_data_dispatcher::spawn(tecmp_data_r).unwrap();
-        can1_enable::spawn().unwrap();
-        can2_enable::spawn().unwrap();
+        tecmp_event_dispatcher::spawn(tecmp_event_r).unwrap();
 
         Mono::start(200_000_000);
 
@@ -195,7 +194,7 @@ mod app {
                 link_led,
                 tecmp_sender_can1: tecmp_s.clone(),
                 tecmp_sender_can2: tecmp_s,
-                tecmp_data_sender: tecmp_data_s,
+                tecmp_event_sender: tecmp_event_s,
             },
         )
     }
@@ -211,42 +210,13 @@ mod app {
         }
     }
 
-    // CAN tasks
-    #[task(priority = 2, shared = [can1])]
-    async fn can1_enable(mut ctx: can1_enable::Context) {
-        ctx.shared.can1.lock(|can| {
-            can.enable(false);
-        });
-    }
-
-    #[task(priority = 2, shared = [can2])]
-    async fn can2_enable(mut ctx: can2_enable::Context) {
-        ctx.shared.can2.lock(|can| {
-            can.enable(false);
-        });
-    }
-
-    #[task(priority = 2, shared = [can1])]
-    async fn can1_disable(mut ctx: can1_disable::Context) {
-        ctx.shared.can1.lock(|can| {
-            can.disable();
-        });
-    }
-
-    #[task(priority = 2, shared = [can2])]
-    async fn can2_disable(mut ctx: can2_disable::Context) {
-        ctx.shared.can2.lock(|can| {
-            can.disable();
-        });
-    }
-
-    #[task(binds = ETH, shared = [tecmp_handler], local = [tecmp_data_sender], priority = 3)]
+    #[task(binds = ETH, shared = [tecmp_handler], local = [tecmp_event_sender], priority = 3)]
     fn ethernet_event(mut ctx: ethernet_event::Context) {
         unsafe { ethernet::interrupt_handler() }
 
         ctx.shared
             .tecmp_handler
-            .lock(|tecmp_handler| tecmp_handler.receive(ctx.local.tecmp_data_sender));
+            .lock(|tecmp_handler| tecmp_handler.receive(ctx.local.tecmp_event_sender));
     }
 
     #[task(shared = [tecmp_handler], priority = 1)]
@@ -261,22 +231,52 @@ mod app {
     }
 
     #[task(shared = [can1, can2], priority = 1)]
-    async fn tecmp_data_dispatcher(
-        mut ctx: tecmp_data_dispatcher::Context,
-        mut receiver: Receiver<'static, TecmpData, TECMP_CHANNEL_SIZE>,
+    async fn tecmp_event_dispatcher(
+        mut ctx: tecmp_event_dispatcher::Context,
+        mut receiver: Receiver<'static, TecmpEvent, TECMP_CHANNEL_SIZE>,
     ) {
-        while let Ok(data) = receiver.recv().await {
-            defmt::info!("Receiver: got tecmp data");
-            ctx.shared.can1.lock(|can| {
-                if can.interface_id.0 == data.interface_id && !can.transmit_tecmp_data(&data) {
-                    defmt::error!("Could not send can data for interface {}", can.interface_id);
+        while let Ok(event) = receiver.recv().await {
+            match event {
+                TecmpEvent::Data(data) => {
+                    defmt::info!("Receiver: got tecmp data");
+                    ctx.shared.can1.lock(|can| {
+                        if can.interface_id.0 == data.interface_id
+                            && !can.transmit_tecmp_data(&data)
+                        {
+                            defmt::error!(
+                                "Could not send can data for interface {}",
+                                can.interface_id
+                            );
+                        }
+                    });
+                    ctx.shared.can2.lock(|can| {
+                        if can.interface_id.0 == data.interface_id
+                            && !can.transmit_tecmp_data(&data)
+                        {
+                            defmt::error!(
+                                "Could not send can data for interface {}",
+                                can.interface_id
+                            );
+                        }
+                    });
                 }
-            });
-            ctx.shared.can2.lock(|can| {
-                if can.interface_id.0 == data.interface_id && !can.transmit_tecmp_data(&data) {
-                    defmt::error!("Could not send can data for interface {}", can.interface_id);
-                }
-            });
+                TecmpEvent::Config(config) => match config {
+                    TecmpConfig::Can(can_channel_config) => {
+                        defmt::info!("Receiver: got can channel config: {:?}", can_channel_config);
+
+                        ctx.shared.can1.lock(|can| {
+                            if can.interface_id == can_channel_config.interface_id {
+                                can.configure(can_channel_config);
+                            }
+                        });
+                        ctx.shared.can2.lock(|can| {
+                            if can.interface_id == can_channel_config.interface_id {
+                                can.configure(can_channel_config);
+                            }
+                        });
+                    }
+                },
+            }
         }
     }
 

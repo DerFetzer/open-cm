@@ -16,6 +16,8 @@ use tecmp_rs::{
     deku::{DekuWriter as _, no_std_io::Cursor, writer::Writer},
 };
 
+use crate::can::CanChannelConfig;
+
 /// Locally administered MAC address
 pub const LOCAL_MAC_ADDRESS: EthernetAddress =
     EthernetAddress([0x02, 0x6f, 0xbd, 0x3d, 0x4a, 0x04]);
@@ -25,15 +27,30 @@ pub const TECMP_DST_MAC_ADDRESS: EthernetAddress =
 
 pub const TECMP_ETHERTYPE: EthernetProtocol = EthernetProtocol::Unknown(0x99fe);
 
+pub const CONTROL_MESSAGE_CONFIG_ID: u16 = 0x00f0;
+
 pub const ED_NUM: usize = 8;
 pub const TECMP_CHANNEL_SIZE: usize = 10;
 
-#[derive(Debug, Copy, Clone, defmt::Format)]
+#[derive(
+    Debug, Copy, Clone, PartialEq, Eq, defmt::Format, serde::Serialize, serde::Deserialize,
+)]
 pub struct InterfaceId(pub u32);
 
 pub struct TecmpHandler {
     ethdev: ethernet::EthernetDMA<ED_NUM, ED_NUM>,
     tx_counter: u16,
+}
+
+#[derive(Debug, Clone, defmt::Format)]
+pub enum TecmpEvent {
+    Data(TecmpData),
+    Config(TecmpConfig),
+}
+
+#[derive(Debug, Clone, Copy, defmt::Format, serde::Serialize, serde::Deserialize)]
+pub enum TecmpConfig {
+    Can(CanChannelConfig),
 }
 
 impl TecmpHandler {
@@ -90,7 +107,7 @@ impl TecmpHandler {
         (self.tx_counter, _) = self.tx_counter.overflowing_add(1);
     }
 
-    pub fn receive(&mut self, sender: &mut Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>) {
+    pub fn receive(&mut self, sender: &mut Sender<'static, TecmpEvent, TECMP_CHANNEL_SIZE>) {
         while let Some((rx_token, _)) = self.ethdev.receive(Instant::from_micros(0)) {
             rx_token.consume(|buf| {
                 let eth = EthernetFrame::new_unchecked(buf);
@@ -112,8 +129,36 @@ impl TecmpHandler {
                                 for tecmp_data in data_iterator {
                                     defmt::info!("Got tecmp data: {:?}", tecmp_data);
 
-                                    if sender.try_send(tecmp_data).is_err() {
+                                    if sender.try_send(TecmpEvent::Data(tecmp_data)).is_err() {
                                         defmt::error!("Could not send tecmp data");
+                                    }
+                                }
+                            } else if tecmp.header.message_type == MessageType::ControlMessage {
+                                // Data Flags + Device ID
+                                let message_id_offset = 2 + 2;
+                                let message_id = u16::from_be_bytes(
+                                    buf[message_id_offset..message_id_offset + 2]
+                                        .try_into()
+                                        .unwrap(),
+                                );
+                                if message_id != CONTROL_MESSAGE_CONFIG_ID {
+                                    defmt::info!("Ignore tecmp control message due to config id");
+                                } else {
+                                    // + Control Message ID
+                                    let payload_offset = message_id_offset + 2;
+                                    let payload = &buf[payload_offset..];
+
+                                    match serde_json_core::from_slice::<TecmpConfig>(payload) {
+                                        Ok((config, _)) => {
+                                            if sender.try_send(TecmpEvent::Config(config)).is_err()
+                                            {
+                                                defmt::error!("Could not send tecmp data");
+                                            }
+                                        }
+                                        Err(e) => defmt::error!(
+                                            "Could not convert payload to config: {}",
+                                            e
+                                        ),
                                     }
                                 }
                             } else {
