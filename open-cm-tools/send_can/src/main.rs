@@ -1,5 +1,6 @@
 use std::cmp::max;
 use std::error::Error;
+use std::time::Duration;
 
 use pcap::{Capture, Device};
 use smoltcp::wire::{EthernetAddress, EthernetFrame, EthernetProtocol};
@@ -67,4 +68,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     cap.sendpacket(&buf[..tx_len])?;
     Ok(())
+    // loop {
+    //     cap.sendpacket(&buf[..tx_len])?;
+    //     std::thread::sleep(Duration::from_micros(10_000));
+    // }
 }

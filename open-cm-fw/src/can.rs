@@ -1,4 +1,4 @@
-use core::num::{NonZeroU8, NonZeroU16};
+use core::num::NonZeroU8;
 
 use fdcan::{
     BusMonitoringMode, ConfigMode, FdCan, Instance, NormalOperationMode, PoweredDownMode,
@@ -10,9 +10,8 @@ use fdcan::{
     frame::{FrameFormat, RxFrameInfo, TxFrameHeader},
     id::{ExtendedId, Id, StandardId},
 };
+use open_cm_common::{can::CanChannelConfig, tecmp::InterfaceId};
 use tecmp_rs::TecmpData;
-
-use crate::tecmp::InterfaceId;
 
 pub struct CanHandler<I: Instance> {
     state_wrapper: CanStateWrapper<I>,
@@ -34,26 +33,6 @@ pub enum CanStateWrapper<I: Instance> {
 pub enum Fifo {
     Fifo0,
     Fifo1,
-}
-
-#[derive(Debug, Clone, Copy, defmt::Format, serde::Serialize, serde::Deserialize)]
-pub struct CanBitTiming {
-    pub prescaler: NonZeroU16,
-    pub seg1: NonZeroU8,
-    pub seg2: NonZeroU8,
-    pub sync_jump_width: NonZeroU8,
-}
-
-#[derive(Debug, Clone, Copy, defmt::Format, serde::Serialize, serde::Deserialize)]
-pub struct CanChannelConfig {
-    pub interface_id: InterfaceId,
-    pub enabled: bool,
-    pub monitoring: bool,
-    pub nominal_bit_timing: CanBitTiming,
-    pub data_bit_timing: CanBitTiming,
-    pub transceiver_delay_compensation: bool,
-    pub automatic_retransmit: bool,
-    pub protocol_exception_handling: bool,
 }
 
 impl<I: Instance> CanHandler<I> {

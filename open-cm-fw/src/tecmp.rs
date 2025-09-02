@@ -1,10 +1,14 @@
 use core::cmp::max;
 
+use open_cm_common::tecmp::{
+    CM_LOCAL_MAC_ADDRESS, CONTROL_MESSAGE_CONFIG_ID, TECMP_DST_MAC_ADDRESS, TECMP_ETHERTYPE,
+    TecmpConfig, TecmpEvent,
+};
 use rtic_sync::channel::Sender;
 use smoltcp::{
     phy::{Device, RxToken, TxToken},
     time::Instant,
-    wire::{EthernetAddress, EthernetFrame, EthernetProtocol},
+    wire::EthernetFrame,
 };
 use stm32h7xx_hal::ethernet;
 use tecmp_rs::{
@@ -16,41 +20,12 @@ use tecmp_rs::{
     deku::{DekuWriter as _, no_std_io::Cursor, writer::Writer},
 };
 
-use crate::can::CanChannelConfig;
-
-/// Locally administered MAC address
-pub const LOCAL_MAC_ADDRESS: EthernetAddress =
-    EthernetAddress([0x02, 0x6f, 0xbd, 0x3d, 0x4a, 0x04]);
-/// Default TECMP multicast MAC address
-pub const TECMP_DST_MAC_ADDRESS: EthernetAddress =
-    EthernetAddress([0x01, 0x00, 0x5e, 0x00, 0x00, 0x00]);
-
-pub const TECMP_ETHERTYPE: EthernetProtocol = EthernetProtocol::Unknown(0x99fe);
-
-pub const CONTROL_MESSAGE_CONFIG_ID: u16 = 0x00f0;
-
 pub const ED_NUM: usize = 8;
 pub const TECMP_CHANNEL_SIZE: usize = 10;
-
-#[derive(
-    Debug, Copy, Clone, PartialEq, Eq, defmt::Format, serde::Serialize, serde::Deserialize,
-)]
-pub struct InterfaceId(pub u32);
 
 pub struct TecmpHandler {
     ethdev: ethernet::EthernetDMA<ED_NUM, ED_NUM>,
     tx_counter: u16,
-}
-
-#[derive(Debug, Clone, defmt::Format)]
-pub enum TecmpEvent {
-    Data(TecmpData),
-    Config(TecmpConfig),
-}
-
-#[derive(Debug, Clone, Copy, defmt::Format, serde::Serialize, serde::Deserialize)]
-pub enum TecmpConfig {
-    Can(CanChannelConfig),
 }
 
 impl TecmpHandler {
@@ -92,7 +67,7 @@ impl TecmpHandler {
                 let mut eth = EthernetFrame::new_unchecked(buf);
 
                 eth.set_dst_addr(TECMP_DST_MAC_ADDRESS);
-                eth.set_src_addr(LOCAL_MAC_ADDRESS);
+                eth.set_src_addr(CM_LOCAL_MAC_ADDRESS);
                 eth.set_ethertype(TECMP_ETHERTYPE);
 
                 let payload = eth.payload_mut();

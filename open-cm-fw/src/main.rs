@@ -3,8 +3,8 @@
 
 use core::mem::MaybeUninit;
 
-use open_cm as _;
-use open_cm::tecmp::ED_NUM;
+use open_cm_fw as _;
+use open_cm_fw::tecmp::ED_NUM;
 
 use stm32h7xx_hal::ethernet;
 
@@ -17,12 +17,11 @@ mod app {
     use fdcan::Instance;
     use fdcan::config::{Interrupt, Interrupts};
     use heapless::Vec;
-    use open_cm::can::CanHandler;
-    use open_cm::can::Fifo;
-    use open_cm::tecmp::TecmpEvent;
-    use open_cm::tecmp::TecmpHandler;
-    use open_cm::tecmp::{InterfaceId, TECMP_CHANNEL_SIZE};
-    use open_cm::tecmp::{LOCAL_MAC_ADDRESS, TecmpConfig};
+    use open_cm_common::tecmp::{CM_LOCAL_MAC_ADDRESS, InterfaceId, TecmpConfig, TecmpEvent};
+    use open_cm_fw::can::CanHandler;
+    use open_cm_fw::can::Fifo;
+    use open_cm_fw::tecmp::TECMP_CHANNEL_SIZE;
+    use open_cm_fw::tecmp::TecmpHandler;
     use rtic_monotonics::stm32::prelude::*;
     use rtic_sync::channel::Receiver;
     use rtic_sync::channel::Sender;
@@ -135,7 +134,7 @@ mod app {
         let can2 = ctx.device.FDCAN2.fdcan(can2_tx, can2_rx, fdcan_prec2);
 
         // Initialise ethernet...
-        let mac_addr = smoltcp::wire::EthernetAddress::from_bytes(&LOCAL_MAC_ADDRESS.0);
+        let mac_addr = smoltcp::wire::EthernetAddress::from_bytes(&CM_LOCAL_MAC_ADDRESS.0);
         let (eth_dma, eth_mac) = unsafe {
             #[allow(static_mut_refs)] // TODO: Fix this
             DES_RING.write(ethernet::DesRing::new());
