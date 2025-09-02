@@ -109,15 +109,18 @@ impl TecmpHandler {
                                     }
                                 }
                             } else if tecmp.header.message_type == MessageType::ControlMessage {
-                                // Data Flags + Device ID
-                                let message_id_offset = 2 + 2;
+                                // Interface ID..Control Message ID
+                                let message_id_offset = 18;
                                 let message_id = u16::from_be_bytes(
                                     buf[message_id_offset..message_id_offset + 2]
                                         .try_into()
                                         .unwrap(),
                                 );
                                 if message_id != CONTROL_MESSAGE_CONFIG_ID {
-                                    defmt::info!("Ignore tecmp control message due to config id");
+                                    defmt::info!(
+                                        "Ignore tecmp control message due to config id: {}",
+                                        message_id
+                                    );
                                 } else {
                                     // + Control Message ID
                                     let payload_offset = message_id_offset + 2;

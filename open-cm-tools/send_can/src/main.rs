@@ -1,23 +1,23 @@
 use std::cmp::max;
 use std::error::Error;
+use std::io::Cursor;
+use std::num::NonZero;
 use std::time::Duration;
 
+use open_cm_common::can::{CanBitTiming, CanChannelConfig};
+use open_cm_common::tecmp::{CONTROL_MESSAGE_CONFIG_ID, InterfaceId, TECMP_ETHERTYPE, TecmpConfig};
 use pcap::{Capture, Device};
-use smoltcp::wire::{EthernetAddress, EthernetFrame, EthernetProtocol};
+use smoltcp::wire::{EthernetAddress, EthernetFrame};
+use tecmp_rs::deku::writer::Writer;
 use tecmp_rs::{CanData, CanDataFlags, DataType, deku::DekuContainerWrite};
 use tecmp_rs::{
     MessageType, Tecmp, TecmpData, TecmpGlobalHeader,
-    deku::{DekuUpdate as _, DekuWriter as _, no_std_io::Cursor, writer::Writer},
+    deku::{DekuUpdate as _, DekuWriter as _},
 };
 
 /// Locally administered MAC address
 pub const LOCAL_MAC_ADDRESS: EthernetAddress =
     EthernetAddress([0x02, 0x6f, 0xbd, 0x3d, 0x4a, 0x00]);
-/// Default TECMP multicast MAC address
-pub const TECMP_DST_MAC_ADDRESS: EthernetAddress =
-    EthernetAddress([0x01, 0x00, 0x5e, 0x00, 0x00, 0x00]);
-
-pub const TECMP_ETHERTYPE: EthernetProtocol = EthernetProtocol::Unknown(0x99fe);
 
 fn main() -> Result<(), Box<dyn Error>> {
     let device = Device::lookup()?.unwrap();
@@ -25,12 +25,85 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut buf = [0; 1500];
 
-    let mut packet = EthernetFrame::new_checked(&mut buf)?;
-    packet.set_src_addr(LOCAL_MAC_ADDRESS);
-    packet.set_dst_addr(EthernetAddress::BROADCAST);
-    packet.set_ethertype(TECMP_ETHERTYPE);
+    let mut config_packet = EthernetFrame::new_checked(&mut buf)?;
+    config_packet.set_src_addr(LOCAL_MAC_ADDRESS);
+    config_packet.set_dst_addr(EthernetAddress::BROADCAST);
+    config_packet.set_ethertype(TECMP_ETHERTYPE);
 
-    let payload = packet.payload_mut();
+    let payload = config_packet.payload_mut();
+
+    let tecmp = Tecmp {
+        header: TecmpGlobalHeader {
+            device_id: 1,
+            counter: 0,
+            version: 3,
+            message_type: MessageType::ControlMessage,
+            data_type: DataType::NoData,
+            reserved: 0,
+            device_flags: Default::default(),
+        },
+    };
+
+    let mut data = TecmpData {
+        interface_id: 1,
+        timestamp: 0,
+        length: 0,
+        data: tecmp_rs::Data::NoData,
+    };
+
+    let mut channel_config = CanChannelConfig {
+        interface_id: InterfaceId(2),
+        enabled: true,
+        monitoring: false,
+        nominal_bit_timing: CanBitTiming {
+            prescaler: NonZero::new(8).unwrap(),
+            seg1: NonZero::new(3).unwrap(),
+            seg2: NonZero::new(1).unwrap(),
+            sync_jump_width: NonZero::new(1).unwrap(),
+        },
+        data_bit_timing: CanBitTiming {
+            prescaler: NonZero::new(4).unwrap(),
+            seg1: NonZero::new(3).unwrap(),
+            seg2: NonZero::new(1).unwrap(),
+            sync_jump_width: NonZero::new(1).unwrap(),
+        },
+        transceiver_delay_compensation: false,
+        automatic_retransmit: false,
+        protocol_exception_handling: true,
+    };
+    let config = TecmpConfig::Can(channel_config);
+    let config_bytes = serde_json::to_vec(&config)?;
+    data.length = config_bytes.len() as u16 + 4;
+
+    let data_offset = tecmp.to_slice(payload).unwrap();
+    let mut writer = Writer::new(Cursor::new(&mut payload[data_offset..]));
+    data.to_writer(&mut writer, data.data.data_type()).unwrap();
+    assert_eq!(writer.bits_written % 8, 0);
+    let bytes_written = writer.bits_written / 8;
+
+    payload[data_offset + bytes_written + 4..data_offset + bytes_written + 6]
+        .copy_from_slice(&CONTROL_MESSAGE_CONFIG_ID.to_be_bytes());
+
+    // + 2 bytes Data Flags + 2 bytes Device Id + 2 bytes Control Message ID
+    let config_offset = data_offset + bytes_written + 6;
+    payload[config_offset..config_offset + config_bytes.len()]
+        .copy_from_slice(config_bytes.as_slice());
+
+    let tx_len = max(
+        64,
+        EthernetFrame::<&[u8]>::buffer_len(config_offset + config_bytes.len()),
+    );
+
+    cap.sendpacket(&buf[..tx_len])?;
+    std::thread::sleep(Duration::from_secs(1));
+
+    buf.fill(0);
+    let mut replay_packet = EthernetFrame::new_checked(&mut buf)?;
+    replay_packet.set_src_addr(LOCAL_MAC_ADDRESS);
+    replay_packet.set_dst_addr(EthernetAddress::BROADCAST);
+    replay_packet.set_ethertype(TECMP_ETHERTYPE);
+
+    let payload = replay_packet.payload_mut();
 
     let tecmp = Tecmp {
         header: TecmpGlobalHeader {
