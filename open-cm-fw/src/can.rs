@@ -11,6 +11,7 @@ use fdcan::{
     id::{ExtendedId, Id, StandardId},
 };
 use heapless::Vec;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 use open_cm_common::{can::CanChannelConfig, tecmp::InterfaceId};
 use rtic_sync::channel::Sender;
 use tecmp_rs::{CanDataFlags, CanFdDataFlags, TecmpData, deku::DekuUpdate};
@@ -41,6 +42,52 @@ pub enum CanStateWrapper<I: Instance> {
 pub enum Fifo {
     Fifo0,
     Fifo1,
+}
+
+#[derive(Debug, Copy, Clone, TryFromPrimitive, IntoPrimitive, defmt::Format)]
+#[repr(u8)]
+enum LastErrorCode {
+    NoError = 0,
+    StuffError = 1,
+    FormError = 2,
+    AckError = 3,
+    Bit1Error = 4,
+    Bit2Error = 5,
+    CrcError = 6,
+    NoChange = 7,
+}
+
+impl From<LastErrorCode> for CanDataFlags {
+    fn from(lec: LastErrorCode) -> Self {
+        CanDataFlags {
+            ack: !matches!(lec, LastErrorCode::AckError),
+            err: true,
+            bit_stuff_err: matches!(lec, LastErrorCode::StuffError),
+            crc_err: matches!(lec, LastErrorCode::CrcError),
+            tx: matches!(
+                lec,
+                LastErrorCode::AckError | LastErrorCode::Bit1Error | LastErrorCode::Bit2Error
+            ),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<LastErrorCode> for CanFdDataFlags {
+    fn from(lec: LastErrorCode) -> Self {
+        CanFdDataFlags {
+            ack: matches!(lec, LastErrorCode::AckError),
+            brs: true,
+            err: true,
+            bit_stuff_err: matches!(lec, LastErrorCode::StuffError),
+            crc_err: matches!(lec, LastErrorCode::CrcError),
+            tx: matches!(
+                lec,
+                LastErrorCode::AckError | LastErrorCode::Bit1Error | LastErrorCode::Bit2Error
+            ),
+            ..Default::default()
+        }
+    }
 }
 
 impl<I: Instance> CanHandler<I> {
@@ -265,10 +312,50 @@ impl<I: Instance> CanHandler<I> {
         }
         // Error
         if self.has_interrupt(Interrupt::ProtErrArbritation) {
-            defmt::warn!("{}: ProtErrArbitration", self.interface_id);
+            let lec = LastErrorCode::try_from_primitive(
+                unsafe { &*self.register_block.0 }.psr.read().lec().bits(),
+            )
+            .expect("Bit pattern should always be valid");
+            defmt::warn!("{}: ProtErrArbitration => {:?}", self.interface_id, lec);
+            let mut tecmp_data = TecmpData {
+                interface_id: self.interface_id.0,
+                timestamp,
+                length: 0, // Is set via update()
+                data: tecmp_rs::Data::Can(tecmp_rs::CanData {
+                    flags: lec.into(),
+                    can_id: 0,
+                    payload_length: 0,
+                    payload: Vec::new(),
+                    crc: [0; 2],
+                }),
+            };
+            tecmp_data.update().unwrap();
+            if tecmp_s.try_send(tecmp_data).is_err() {
+                defmt::warn!("Could not send tecmp data to channel");
+            }
         }
         if self.has_interrupt(Interrupt::ProtErrData) {
-            defmt::warn!("{}: ProtErrData", self.interface_id);
+            let lec = LastErrorCode::try_from_primitive(
+                unsafe { &*self.register_block.0 }.psr.read().dlec().bits(),
+            )
+            .expect("Bit pattern should always be valid");
+            defmt::warn!("{}: ProtErrData => {:?}", self.interface_id, lec);
+            let mut tecmp_data = TecmpData {
+                interface_id: self.interface_id.0,
+                timestamp,
+                length: 0, // Is set via update()
+                data: tecmp_rs::Data::CanFd(tecmp_rs::CanFdData {
+                    flags: lec.into(),
+                    can_id: 0,
+                    payload_length: 0,
+                    payload: Vec::new(),
+                    crc: [0; 3],
+                }),
+            };
+            tecmp_data.update().unwrap();
+            if tecmp_s.try_send(tecmp_data).is_err() {
+                defmt::warn!("Could not send tecmp data to channel");
+            }
         }
         self.clear_interrupts(Interrupts::all());
     }
