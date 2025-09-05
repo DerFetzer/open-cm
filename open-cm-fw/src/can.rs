@@ -10,14 +10,22 @@ use fdcan::{
     frame::{FrameFormat, RxFrameInfo, TxFrameHeader},
     id::{ExtendedId, Id, StandardId},
 };
+use heapless::Vec;
 use open_cm_common::{can::CanChannelConfig, tecmp::InterfaceId};
-use tecmp_rs::TecmpData;
+use rtic_sync::channel::Sender;
+use tecmp_rs::{CanDataFlags, CanFdDataFlags, TecmpData, deku::DekuUpdate};
+
+use crate::tecmp::TECMP_CHANNEL_SIZE;
 
 pub struct CanHandler<I: Instance> {
     state_wrapper: CanStateWrapper<I>,
     pub fifo: Fifo,
     pub interface_id: InterfaceId,
+    register_block: RegisterBlockSendWrapper,
 }
+
+struct RegisterBlockSendWrapper(*const fdcan::RegisterBlock);
+unsafe impl Send for RegisterBlockSendWrapper {}
 
 #[derive(Default)]
 pub enum CanStateWrapper<I: Instance> {
@@ -36,7 +44,12 @@ pub enum Fifo {
 }
 
 impl<I: Instance> CanHandler<I> {
-    pub fn new(mut can: FdCan<I, ConfigMode>, fifo: Fifo, interface_id: InterfaceId) -> Self {
+    pub fn new(
+        mut can: FdCan<I, ConfigMode>,
+        fifo: Fifo,
+        interface_id: InterfaceId,
+        register_block: *const fdcan::RegisterBlock,
+    ) -> Self {
         match fifo {
             Fifo::Fifo0 => {
                 can.set_standard_filter(
@@ -69,6 +82,7 @@ impl<I: Instance> CanHandler<I> {
             state_wrapper: CanStateWrapper::Config(can),
             fifo,
             interface_id,
+            register_block: RegisterBlockSendWrapper(register_block),
         }
     }
 
@@ -182,6 +196,81 @@ impl<I: Instance> CanHandler<I> {
                 None
             }
         }
+    }
+
+    pub fn handle_can_event(
+        &mut self,
+        timestamp: u64,
+        tecmp_s: &mut Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
+    ) {
+        // Fifo
+        let interrupt = match self.fifo {
+            Fifo::Fifo0 => Interrupt::RxFifo0NewMsg,
+            Fifo::Fifo1 => Interrupt::RxFifo1NewMsg,
+        };
+        if self.has_interrupt(interrupt) {
+            defmt::info!("{} has new message(s)", self.interface_id);
+            let mut buf = [0; 64];
+            while let Some(header) = self.receive(&mut buf) {
+                let mut tecmp_data = TecmpData {
+                    interface_id: self.interface_id.0,
+                    timestamp,
+                    length: 0, // Set later
+                    data: match header.frame_format {
+                        fdcan::frame::FrameFormat::Standard => {
+                            tecmp_rs::Data::Can(tecmp_rs::CanData {
+                                flags: CanDataFlags {
+                                    ack: true,
+                                    ..Default::default()
+                                },
+                                can_id: match header.id {
+                                    fdcan::id::Id::Standard(standard_id) => {
+                                        standard_id.as_raw() as u32
+                                    }
+                                    fdcan::id::Id::Extended(extended_id) => {
+                                        extended_id.as_raw() | (1 << 31)
+                                    }
+                                },
+                                payload_length: header.len,
+                                payload: Vec::from_slice(&buf[..header.len as usize]).unwrap(),
+                                crc: [0; 2],
+                            })
+                        }
+                        fdcan::frame::FrameFormat::Fdcan => {
+                            tecmp_rs::Data::CanFd(tecmp_rs::CanFdData {
+                                flags: CanFdDataFlags {
+                                    ack: true,
+                                    ..Default::default()
+                                },
+                                can_id: match header.id {
+                                    fdcan::id::Id::Standard(standard_id) => {
+                                        standard_id.as_raw() as u32
+                                    }
+                                    fdcan::id::Id::Extended(extended_id) => {
+                                        extended_id.as_raw() | (1 << 31)
+                                    }
+                                },
+                                payload_length: header.len,
+                                payload: Vec::from_slice(&buf[..header.len as usize]).unwrap(),
+                                crc: [0; 3],
+                            })
+                        }
+                    },
+                };
+                tecmp_data.update().unwrap();
+                if tecmp_s.try_send(tecmp_data).is_err() {
+                    defmt::warn!("Could not send tecmp data to channel");
+                }
+            }
+        }
+        // Error
+        if self.has_interrupt(Interrupt::ProtErrArbritation) {
+            defmt::warn!("{}: ProtErrArbitration", self.interface_id);
+        }
+        if self.has_interrupt(Interrupt::ProtErrData) {
+            defmt::warn!("{}: ProtErrData", self.interface_id);
+        }
+        self.clear_interrupts(Interrupts::all());
     }
 
     pub fn has_interrupt(&mut self, interrupt: Interrupt) -> bool {

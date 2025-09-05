@@ -14,9 +14,6 @@ static mut DES_RING: MaybeUninit<ethernet::DesRing<ED_NUM, ED_NUM>> = MaybeUnini
 
 #[rtic::app(device = stm32h7xx_hal::stm32, peripherals = true, dispatchers = [EXTI0, EXTI1])]
 mod app {
-    use fdcan::Instance;
-    use fdcan::config::{Interrupt, Interrupts};
-    use heapless::Vec;
     use open_cm_common::tecmp::{CM_LOCAL_MAC_ADDRESS, InterfaceId, TecmpConfig, TecmpEvent};
     use open_cm_fw::can::CanHandler;
     use open_cm_fw::can::Fifo;
@@ -37,8 +34,7 @@ mod app {
             rec::{Fdcan, FdcanClkSel},
         },
     };
-    use tecmp_rs::deku::DekuUpdate as _;
-    use tecmp_rs::{CanDataFlags, CanFdDataFlags, TecmpData};
+    use tecmp_rs::TecmpData;
 
     use super::*;
 
@@ -185,8 +181,8 @@ mod app {
         (
             SharedResources {
                 tecmp_handler,
-                can1: CanHandler::new(can1, Fifo::Fifo0, InterfaceId(0x1)),
-                can2: CanHandler::new(can2, Fifo::Fifo1, InterfaceId(0x2)),
+                can1: CanHandler::new(can1, Fifo::Fifo0, InterfaceId(0x1), FDCAN1::ptr() as _),
+                can2: CanHandler::new(can2, Fifo::Fifo1, InterfaceId(0x2), FDCAN2::ptr() as _),
             },
             LocalResources {
                 lan8742a,
@@ -279,87 +275,21 @@ mod app {
         }
     }
 
-    fn handle_can_event<I: Instance>(
-        can: &mut CanHandler<I>,
-        tecmp_s: &mut Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
-    ) {
-        let interrupt = match can.fifo {
-            Fifo::Fifo0 => Interrupt::RxFifo0NewMsg,
-            Fifo::Fifo1 => Interrupt::RxFifo1NewMsg,
-        };
-        if can.has_interrupt(interrupt) {
-            defmt::info!("{} has new message(s)", can.interface_id);
-            let mut buf = [0; 64];
-            while let Some(header) = can.receive(&mut buf) {
-                let mut tecmp_data = TecmpData {
-                    interface_id: can.interface_id.0,
-                    timestamp: Mono::now().ticks() * 1000,
-                    length: 0, // Set later
-                    data: match header.frame_format {
-                        fdcan::frame::FrameFormat::Standard => {
-                            tecmp_rs::Data::Can(tecmp_rs::CanData {
-                                flags: CanDataFlags {
-                                    ack: true,
-                                    ..Default::default()
-                                },
-                                can_id: match header.id {
-                                    fdcan::id::Id::Standard(standard_id) => {
-                                        standard_id.as_raw() as u32
-                                    }
-                                    fdcan::id::Id::Extended(extended_id) => {
-                                        extended_id.as_raw() | (1 << 31)
-                                    }
-                                },
-                                payload_length: header.len,
-                                payload: Vec::from_slice(&buf[..header.len as usize]).unwrap(),
-                                crc: [0; 2],
-                            })
-                        }
-                        fdcan::frame::FrameFormat::Fdcan => {
-                            tecmp_rs::Data::CanFd(tecmp_rs::CanFdData {
-                                flags: CanFdDataFlags {
-                                    ack: true,
-                                    ..Default::default()
-                                },
-                                can_id: match header.id {
-                                    fdcan::id::Id::Standard(standard_id) => {
-                                        standard_id.as_raw() as u32
-                                    }
-                                    fdcan::id::Id::Extended(extended_id) => {
-                                        extended_id.as_raw() | (1 << 31)
-                                    }
-                                },
-                                payload_length: header.len,
-                                payload: Vec::from_slice(&buf[..header.len as usize]).unwrap(),
-                                crc: [0; 3],
-                            })
-                        }
-                    },
-                };
-                tecmp_data.update().unwrap();
-                if tecmp_s.try_send(tecmp_data).is_err() {
-                    defmt::warn!("Could not send tecmp data to channel");
-                }
-            }
-        }
-        can.clear_interrupts(Interrupts::all());
-    }
-
     #[task(binds = FDCAN1_IT0, shared = [can1], local = [tecmp_sender_can1], priority = 3)]
     fn can1_event(mut ctx: can1_event::Context) {
         defmt::info!("Got FDCAN1_IT0 interrupt");
         let tecmp_sender = ctx.local.tecmp_sender_can1;
-        ctx.shared
-            .can1
-            .lock(|can1| handle_can_event(can1, tecmp_sender));
+        ctx.shared.can1.lock(|can1| {
+            can1.handle_can_event(Mono::now().ticks() * 1000, tecmp_sender);
+        });
     }
 
     #[task(binds = FDCAN2_IT0, shared = [can2], local = [tecmp_sender_can2], priority = 3)]
     fn can2_event(mut ctx: can2_event::Context) {
         defmt::info!("Got FDCAN2_IT0 interrupt");
         let tecmp_sender = ctx.local.tecmp_sender_can2;
-        ctx.shared
-            .can2
-            .lock(|can2| handle_can_event(can2, tecmp_sender));
+        ctx.shared.can2.lock(|can2| {
+            can2.handle_can_event(Mono::now().ticks() * 1000, tecmp_sender);
+        });
     }
 }
