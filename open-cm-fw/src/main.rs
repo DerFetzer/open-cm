@@ -14,9 +14,12 @@ static mut DES_RING: MaybeUninit<ethernet::DesRing<ED_NUM, ED_NUM>> = MaybeUnini
 
 #[rtic::app(device = stm32h7xx_hal::stm32, peripherals = true, dispatchers = [EXTI0, EXTI1])]
 mod app {
+    use heapless::Vec;
     use open_cm_common::tecmp::{CM_LOCAL_MAC_ADDRESS, InterfaceId, TecmpConfig, TecmpEvent};
     use open_cm_fw::can::CanHandler;
     use open_cm_fw::can::Fifo;
+    use open_cm_fw::lin::LinHandler;
+    use open_cm_fw::lin::ProtectedIdentifier;
     use open_cm_fw::tecmp::TECMP_CHANNEL_SIZE;
     use open_cm_fw::tecmp::TecmpHandler;
     use rtic_monotonics::stm32::prelude::*;
@@ -43,6 +46,7 @@ mod app {
         tecmp_handler: TecmpHandler,
         can1: CanHandler<Can<FDCAN1>>,
         can2: CanHandler<Can<FDCAN2>>,
+        lin: LinHandler,
     }
     #[local]
     struct LocalResources {
@@ -65,6 +69,7 @@ mod app {
         let rcc = ctx.device.RCC.constrain();
         let ccdr = rcc
             .use_hse(25.MHz())
+            .bypass_hse()
             .sys_ck(200.MHz())
             .hclk(200.MHz())
             .pll1_strategy(PllConfigStrategy::Iterative)
@@ -91,6 +96,7 @@ mod app {
         let gpioa = ctx.device.GPIOA.split(ccdr.peripheral.GPIOA);
         let gpioc = ctx.device.GPIOC.split(ccdr.peripheral.GPIOC);
         let gpiob = ctx.device.GPIOB.split(ccdr.peripheral.GPIOB);
+        let gpiof = ctx.device.GPIOF.split(ccdr.peripheral.GPIOF);
         let gpiog = ctx.device.GPIOG.split(ccdr.peripheral.GPIOG);
         let gpioh = ctx.device.GPIOH.split(ccdr.peripheral.GPIOH);
 
@@ -98,11 +104,13 @@ mod app {
         let mut lcd_bl_ctrl = gpiog.pg15.into_push_pull_output();
         lcd_bl_ctrl.set_low();
 
-        let mut lcd_rst = gpioh.ph6.into_push_pull_output();
-        lcd_rst.set_low();
+        let _lcd_rst = gpioh
+            .ph6
+            .into_push_pull_output_in_state(gpio::PinState::Low);
 
-        let mut link_led = gpioc.pc3.into_push_pull_output(); // USR LED1
-        link_led.set_high();
+        let link_led = gpioc
+            .pc3
+            .into_push_pull_output_in_state(gpio::PinState::High); // USR LED1
 
         // CAN
         let can1_rx = gpioh.ph14.into_alternate().speed(Speed::VeryHigh);
@@ -110,6 +118,13 @@ mod app {
 
         let can2_rx = gpiob.pb5.into_alternate().speed(Speed::VeryHigh);
         let can2_tx = gpiob.pb6.into_alternate().speed(Speed::VeryHigh);
+
+        // LIN
+        let lin_tx = gpiof.pf7.into_alternate();
+        let lin_rx = gpiof.pf6.into_alternate();
+        let _lin_en = gpioh
+            .ph1
+            .into_push_pull_output_in_state(gpio::PinState::High);
 
         // Ethernet
         let rmii_ref_clk = gpioa.pa1.into_alternate();
@@ -128,6 +143,18 @@ mod app {
         let fdcan_prec2 = unsafe { (&fdcan_prec1 as *const Fdcan).read() };
         let can1 = ctx.device.FDCAN1.fdcan(can1_tx, can1_rx, fdcan_prec1);
         let can2 = ctx.device.FDCAN2.fdcan(can2_tx, can2_rx, fdcan_prec2);
+
+        // Initialize LIN...
+        let lin_serial = ctx
+            .device
+            .UART7
+            .serial(
+                (lin_tx, lin_rx),
+                19_200.bps(),
+                ccdr.peripheral.UART7,
+                &ccdr.clocks,
+            )
+            .unwrap();
 
         // Initialise ethernet...
         let mac_addr = smoltcp::wire::EthernetAddress::from_bytes(&CM_LOCAL_MAC_ADDRESS.0);
@@ -175,6 +202,8 @@ mod app {
         // Spawn tasks
         tecmp_sender::spawn(tecmp_r).unwrap();
         tecmp_event_dispatcher::spawn(tecmp_event_r).unwrap();
+        lin_test::spawn().unwrap();
+        lin_set_slave_data::spawn(Vec::from_array([0x1, 0x2, 0x3, 0x0])).unwrap();
 
         Mono::start(200_000_000);
 
@@ -183,6 +212,7 @@ mod app {
                 tecmp_handler,
                 can1: CanHandler::new(can1, Fifo::Fifo0, InterfaceId(0x1), FDCAN1::ptr() as _),
                 can2: CanHandler::new(can2, Fifo::Fifo1, InterfaceId(0x2), FDCAN2::ptr() as _),
+                lin: LinHandler::new(lin_serial, 19_200.bps().into()),
             },
             LocalResources {
                 lan8742a,
@@ -203,6 +233,24 @@ mod app {
                 _ => ctx.local.link_led.set_high(),
             }
         }
+    }
+
+    #[task(shared = [lin], priority = 1)]
+    async fn lin_test(mut ctx: lin_test::Context) {
+        loop {
+            Mono::delay(500u64.millis()).await;
+            ctx.shared.lin.lock(|lin| {
+                lin.send_master_request(ProtectedIdentifier::from_id(0x02))
+                    .unwrap()
+            });
+        }
+    }
+
+    #[task(shared = [lin], priority = 1)]
+    async fn lin_set_slave_data(mut ctx: lin_set_slave_data::Context, data: Vec<u8, 9>) {
+        ctx.shared
+            .lin
+            .lock(|lin| lin.set_slave_data(0x2, data, Some(open_cm_fw::lin::LinChecksum::Classic)))
     }
 
     #[task(binds = ETH, shared = [tecmp_handler], local = [tecmp_event_sender], priority = 3)]
@@ -290,6 +338,15 @@ mod app {
         let tecmp_sender = ctx.local.tecmp_sender_can2;
         ctx.shared.can2.lock(|can2| {
             can2.handle_can_event(Mono::now().ticks() * 1000, tecmp_sender);
+        });
+    }
+
+    #[task(binds = UART7, shared = [lin],  priority = 2)]
+    fn uart7_event(mut ctx: uart7_event::Context) {
+        defmt::info!("Got UART7 interrupt");
+        ctx.shared.lin.lock(|lin| {
+            lin.handle_break_detected();
+            lin.handle_rx_fifo_threshold().unwrap();
         });
     }
 }

@@ -2,6 +2,7 @@
 #![no_std]
 
 pub mod can;
+pub mod lin;
 pub mod tecmp;
 
 use defmt_rtt as _; // global logger
@@ -39,10 +40,24 @@ unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
 #[cfg(test)]
 #[defmt_test::tests]
 mod unit_tests {
-    use defmt::assert;
+    use defmt::{assert, assert_eq};
+
+    use crate::lin::{ProtectedIdentifier, calc_lin_chksum};
 
     #[test]
-    fn it_works() {
-        assert!(true)
+    fn lin_pid() {
+        let valid_pid = ProtectedIdentifier(0x42);
+        assert!(valid_pid.is_valid());
+        assert_eq!(valid_pid.get_id(), 0x02);
+
+        let valid_pid = ProtectedIdentifier(0x1A);
+        assert!(valid_pid.is_valid());
+        assert_eq!(valid_pid.get_id(), 0x1A);
+    }
+
+    #[test]
+    fn lin_chksum() {
+        let buf = [0x4A, 0x55, 0x93, 0xE5];
+        assert_eq!(calc_lin_chksum(&buf, 0), 0xe6);
     }
 }
