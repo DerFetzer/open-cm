@@ -54,6 +54,7 @@ mod app {
         link_led: gpio::gpioc::PC3<gpio::Output<gpio::PushPull>>,
         tecmp_sender_can1: Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
         tecmp_sender_can2: Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
+        tecmp_sender_lin: Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
         tecmp_event_sender: Sender<'static, TecmpEvent, TECMP_CHANNEL_SIZE>,
     }
 
@@ -203,7 +204,7 @@ mod app {
         tecmp_sender::spawn(tecmp_r).unwrap();
         tecmp_event_dispatcher::spawn(tecmp_event_r).unwrap();
         lin_test::spawn().unwrap();
-        lin_set_slave_data::spawn(Vec::from_array([0x1, 0x2, 0x3, 0x0])).unwrap();
+        lin_set_slave_data::spawn(Vec::from_array([0x1, 0x2, 0x3, 0x4, 0x0])).unwrap();
 
         Mono::start(200_000_000);
 
@@ -218,7 +219,8 @@ mod app {
                 lan8742a,
                 link_led,
                 tecmp_sender_can1: tecmp_s.clone(),
-                tecmp_sender_can2: tecmp_s,
+                tecmp_sender_can2: tecmp_s.clone(),
+                tecmp_sender_lin: tecmp_s,
                 tecmp_event_sender: tecmp_event_s,
             },
         )
@@ -341,12 +343,15 @@ mod app {
         });
     }
 
-    #[task(binds = UART7, shared = [lin],  priority = 2)]
+    #[task(binds = UART7, shared = [lin],  local = [tecmp_sender_lin], priority = 2)]
     fn uart7_event(mut ctx: uart7_event::Context) {
         defmt::info!("Got UART7 interrupt");
+        let tecmp_sender = ctx.local.tecmp_sender_lin;
         ctx.shared.lin.lock(|lin| {
             lin.handle_break_detected();
             lin.handle_rx_fifo_threshold().unwrap();
+            lin.handle_idle(Mono::now().ticks() * 1000, tecmp_sender)
+                .unwrap();
         });
     }
 }

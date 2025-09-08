@@ -1,20 +1,29 @@
 use core::convert::Infallible;
 
 use heapless::Vec;
+use open_cm_common::tecmp::InterfaceId;
+use rtic_sync::channel::Sender;
 use stm32h7xx_hal::{
     hal_02::serial::{Read, Write},
     nb,
     pac::UART7,
     serial::{
-        Event, Rx, Serial, Tx,
+        self, Event, Rx, Serial, Tx,
         config::{BitOrder, Config, FifoThreshold, Parity, StopBits},
     },
+    time::Hertz,
 };
+use tecmp_rs::{LinData, LinDataFlags, TecmpData, deku::DekuUpdate};
+
+use crate::tecmp::TECMP_CHANNEL_SIZE;
+
+const INTERFACE_ID: InterfaceId = InterfaceId(0x3);
 
 pub struct LinHandler {
     serial: Serial<UART7>,
     config: Config,
     slave_data: [Vec<u8, 9>; 64],
+    current_pid: Option<ProtectedIdentifier>,
 }
 
 pub enum LinChecksum {
@@ -39,7 +48,7 @@ impl ProtectedIdentifier {
     }
 
     pub fn set_parity_bits(&mut self) {
-        let p0 = (((self.0 >> 0) & 0b1)
+        let p0 = ((self.0 & 0b1)
             ^ ((self.0 >> 1) & 0b1)
             ^ ((self.0 >> 2) & 0b1)
             ^ ((self.0 >> 4) & 0b1))
@@ -79,6 +88,17 @@ impl LinHandler {
         // Interrupt has to fire when two words are in it to detect master requests
         assert!(config.rxfifothreshold == FifoThreshold::Eighth);
 
+        Self::modify_serial();
+
+        Self {
+            serial,
+            config,
+            slave_data: [const { Vec::new() }; 64],
+            current_pid: None,
+        }
+    }
+
+    fn modify_serial() {
         let register_block = unsafe { &*UART7::ptr() };
 
         // Disable peripheral, enable LIN mode and interrupts and enable again
@@ -87,12 +107,13 @@ impl LinHandler {
             .cr2
             .modify(|_, w| w.linen().enabled().lbdie().enabled());
         register_block.cr1.modify(|_, w| w.ue().enabled());
+    }
 
-        Self {
-            serial,
-            config,
-            slave_data: [const { Vec::new() }; 64],
-        }
+    pub fn set_bitrate(&mut self, bitrate: Hertz) {
+        while !self.serial.is_idle() {}
+        self.config.baudrate(bitrate);
+        self.serial.reconfigure(self.config);
+        Self::modify_serial();
     }
 
     pub fn set_slave_data(
@@ -134,6 +155,15 @@ impl LinHandler {
             registers.icr.write(|w| w.lbdcf().set_bit());
 
             self.serial.unlisten(Event::Rxftie);
+            registers.icr.write(|w| w.idlecf().set_bit());
+            self.serial.unlisten(Event::Idle);
+
+            if let Some(current_pid) = self.current_pid.take() {
+                defmt::warn!(
+                    "Break detected during waiting for bytes for id {:#x}",
+                    current_pid
+                );
+            }
 
             // Clear receive FIFO
             let mut rx: Rx<UART7> = unsafe { core::mem::zeroed() };
@@ -146,10 +176,68 @@ impl LinHandler {
         }
     }
 
+    pub fn handle_idle(
+        &mut self,
+        timestamp: u64,
+        tecmp_s: &mut Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
+    ) -> nb::Result<u8, serial::Error> {
+        let registers = unsafe { &*UART7::ptr() };
+        if registers.isr.read().idle().bit_is_set() {
+            defmt::info!("Idle detected");
+
+            // Clear interrupt flag
+            registers.icr.write(|w| w.idlecf().set_bit());
+            self.serial.unlisten(Event::Idle);
+
+            if let Some(current_pid) = self.current_pid.take() {
+                // Read receive FIFO
+                let mut rx: Rx<UART7> = unsafe { core::mem::zeroed() };
+
+                let mut data: Vec<u8, 9> = Vec::new();
+                while rx.is_rxne() {
+                    if data.push(rx.read()?).is_err() {
+                        defmt::warn!("More than 9 bytes in FIFO");
+                    }
+                }
+                defmt::info!(
+                    "Read {} bytes for id {:#x}: {:?}",
+                    data.len(),
+                    current_pid,
+                    data
+                );
+
+                let mut tecmp_data = TecmpData {
+                    interface_id: INTERFACE_ID.0,
+                    timestamp,
+                    length: 0, // Set later
+                    data: tecmp_rs::Data::Lin(LinData {
+                        flags: LinDataFlags {
+                            parity_err: !current_pid.is_valid(),
+                            no_slave_response: data.is_empty(),
+                            // checksum_err: todo!(),
+                            ..Default::default()
+                        },
+                        lin_id: current_pid.get_id(),
+                        payload_length: (data.len() as u8) - 1,
+                        payload: Vec::from_slice(&data[..data.len() as usize - 1]).unwrap(),
+                        checksum: data[data.len() - 1],
+                    }),
+                };
+                tecmp_data.update().unwrap();
+                if tecmp_s.try_send(tecmp_data).is_err() {
+                    defmt::warn!("Could not send tecmp data to channel");
+                }
+            } else {
+                defmt::error!("Unexpected Idle interrupt");
+            }
+        }
+        Ok(0)
+    }
+
     pub fn handle_rx_fifo_threshold(&mut self) -> nb::Result<(), Infallible> {
         let registers = unsafe { &*UART7::ptr() };
-        if registers.isr.read().rxft().bit_is_set() {
-            defmt::info!("Received 2 frames in serial FIFO");
+        if registers.isr.read().rxft().bit_is_set() && registers.cr3.read().rxftie().bit_is_set() {
+            defmt::info!("Received 2 bytes in serial FIFO");
 
             self.serial.unlisten(Event::Rxftie);
 
@@ -167,6 +255,7 @@ impl LinHandler {
                 defmt::warn!("Invalid sync value: {:#x}", sync);
                 return Ok(());
             }
+            self.current_pid = Some(pid);
 
             let slave_data = &self.slave_data[pid.get_id() as usize];
             if !slave_data.is_empty() {
@@ -181,6 +270,9 @@ impl LinHandler {
                     tx.write(*byte)?;
                 }
             }
+
+            registers.icr.write(|w| w.idlecf().set_bit());
+            self.serial.listen(Event::Idle);
         }
         Ok(())
     }
