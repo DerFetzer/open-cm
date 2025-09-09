@@ -350,7 +350,7 @@ mod app {
         ctx.shared.lin.lock(|lin| {
             lin.handle_break_detected();
             lin.handle_rx_fifo_threshold().unwrap();
-            lin.handle_idle(Mono::now().ticks() * 1000, tecmp_sender)
+            lin.handle_receiver_timeout(Mono::now().ticks() * 1000, tecmp_sender)
                 .unwrap();
         });
     }

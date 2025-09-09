@@ -106,6 +106,9 @@ impl LinHandler {
         register_block
             .cr2
             .modify(|_, w| w.linen().enabled().lbdie().enabled());
+        // Set receiver timeout to 2 full bytes + Start/Stop bits
+        register_block.rtor.modify(|_, w| w.rto().bits(20));
+        register_block.cr2.modify(|_, w| w.rtoen().set_bit());
         register_block.cr1.modify(|_, w| w.ue().enabled());
     }
 
@@ -155,8 +158,10 @@ impl LinHandler {
             registers.icr.write(|w| w.lbdcf().set_bit());
 
             self.serial.unlisten(Event::Rxftie);
-            registers.icr.write(|w| w.idlecf().set_bit());
-            self.serial.unlisten(Event::Idle);
+
+            // Clear and disable timeout interrupt
+            registers.icr.write(|w| w.rtocf().set_bit());
+            registers.cr1.modify(|_, w| w.rtoie().clear_bit());
 
             if let Some(current_pid) = self.current_pid.take() {
                 defmt::warn!(
@@ -176,18 +181,18 @@ impl LinHandler {
         }
     }
 
-    pub fn handle_idle(
+    pub fn handle_receiver_timeout(
         &mut self,
         timestamp: u64,
         tecmp_s: &mut Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
     ) -> nb::Result<u8, serial::Error> {
         let registers = unsafe { &*UART7::ptr() };
-        if registers.isr.read().idle().bit_is_set() {
-            defmt::info!("Idle detected");
+        if registers.isr.read().rtof().bit_is_set() {
+            defmt::info!("Receiver timeout detected");
 
-            // Clear interrupt flag
-            registers.icr.write(|w| w.idlecf().set_bit());
-            self.serial.unlisten(Event::Idle);
+            // Clear and disable timeout interrupt
+            registers.icr.write(|w| w.rtocf().set_bit());
+            registers.cr1.modify(|_, w| w.rtoie().clear_bit());
 
             if let Some(current_pid) = self.current_pid.take() {
                 // Read receive FIFO
@@ -228,7 +233,7 @@ impl LinHandler {
                     defmt::warn!("Could not send tecmp data to channel");
                 }
             } else {
-                defmt::error!("Unexpected Idle interrupt");
+                defmt::error!("Unexpected receiver timeout interrupt");
             }
         }
         Ok(0)
@@ -271,8 +276,8 @@ impl LinHandler {
                 }
             }
 
-            registers.icr.write(|w| w.idlecf().set_bit());
-            self.serial.listen(Event::Idle);
+            registers.icr.write(|w| w.rtocf().set_bit());
+            registers.cr1.modify(|_, w| w.rtoie().set_bit());
         }
         Ok(())
     }
