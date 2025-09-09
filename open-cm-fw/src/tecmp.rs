@@ -55,6 +55,8 @@ impl TecmpHandler {
             },
         };
 
+        defmt::debug!("Send tecmp: {:?}", tecmp);
+
         let buf_len = max(
             64,
             EthernetFrame::<&[u8]>::header_len() + tecmp.len() + data.len(),
@@ -98,7 +100,8 @@ impl TecmpHandler {
                         Ok(((buf, _), tecmp)) => {
                             if tecmp.header.message_type == MessageType::ReplayData
                                 && (tecmp.header.data_type == DataType::Can
-                                    || tecmp.header.data_type == DataType::CanFd)
+                                    || tecmp.header.data_type == DataType::CanFd
+                                    || tecmp.header.data_type == DataType::Lin)
                             {
                                 let data_iterator = DataIterator::new(buf, tecmp.header.data_type);
                                 for tecmp_data in data_iterator {

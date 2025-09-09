@@ -7,7 +7,7 @@ edition = "2024"
 serde = { version = "1.0.219", default-features = false, features = ["derive"] }
 defmt = { version = "1.0.1", optional = true }
 smoltcp = { version = "0.12.0", default-features = false, features = ["medium-ethernet", "proto-ipv4", "socket-raw"] }
-tecmp-rs = { path = "../../tecmp-rs" }
+tecmp-rs = { path = "../../tecmp-rs", features = ["serde"] }
 
 [features]
 std = []

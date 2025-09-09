@@ -1,7 +1,7 @@
 use smoltcp::wire::{EthernetAddress, EthernetProtocol};
 use tecmp_rs::TecmpData;
 
-use crate::can::CanChannelConfig;
+use crate::{can::CanChannelConfig, lin::LinConfig};
 
 /// Locally administered MAC address
 pub const CM_LOCAL_MAC_ADDRESS: EthernetAddress =
@@ -25,8 +25,10 @@ pub enum TecmpEvent {
     Config(TecmpConfig),
 }
 
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TecmpConfig {
     Can(CanChannelConfig),
+    Lin(LinConfig),
 }

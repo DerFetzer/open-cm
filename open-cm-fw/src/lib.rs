@@ -7,9 +7,12 @@ pub mod tecmp;
 
 use defmt_rtt as _; // global logger
 
+use rtic_monotonics::fugit::Duration;
 use stm32h7xx_hal as _;
 
 use panic_probe as _;
+
+pub type MonoDuration = Duration<u64, 1, 1_000_000>;
 
 // same panicking *behavior* as `panic-probe` but doesn't print a panic message
 // this prevents the panic message being printed *twice* when `defmt::panic` is invoked

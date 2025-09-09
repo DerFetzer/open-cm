@@ -1,7 +1,14 @@
 use core::convert::Infallible;
 
 use heapless::Vec;
-use open_cm_common::tecmp::InterfaceId;
+use open_cm_common::{
+    lin::{
+        LinChannelConfig, LinChecksum, LinScheduleSlot, LinScheduleTable, ProtectedIdentifier,
+        calc_lin_chksum,
+    },
+    tecmp::InterfaceId,
+};
+use rtic_monotonics::fugit::RateExtU32;
 use rtic_sync::channel::Sender;
 use stm32h7xx_hal::{
     hal_02::serial::{Read, Write},
@@ -11,72 +18,21 @@ use stm32h7xx_hal::{
         self, Event, Rx, Serial, Tx,
         config::{BitOrder, Config, FifoThreshold, Parity, StopBits},
     },
-    time::Hertz,
 };
 use tecmp_rs::{LinData, LinDataFlags, TecmpData, deku::DekuUpdate};
 
 use crate::tecmp::TECMP_CHANNEL_SIZE;
 
-const INTERFACE_ID: InterfaceId = InterfaceId(0x3);
+pub const LIN_INTERFACE_ID: InterfaceId = InterfaceId(0x3);
 
 pub struct LinHandler {
     serial: Serial<UART7>,
     config: Config,
+    checksum_mode: LinChecksum,
     slave_data: [Vec<u8, 9>; 64],
     current_pid: Option<ProtectedIdentifier>,
-}
-
-pub enum LinChecksum {
-    Classic,
-    Enhanced(ProtectedIdentifier),
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, defmt::Format)]
-pub struct ProtectedIdentifier(pub u8);
-
-impl ProtectedIdentifier {
-    pub fn from_id(id: u8) -> Self {
-        let mut pid = Self(id);
-        pid.set_parity_bits();
-        pid
-    }
-
-    pub fn is_valid(&self) -> bool {
-        let mut valid_pid = *self;
-        valid_pid.set_parity_bits();
-        &valid_pid == self
-    }
-
-    pub fn set_parity_bits(&mut self) {
-        let p0 = ((self.0 & 0b1)
-            ^ ((self.0 >> 1) & 0b1)
-            ^ ((self.0 >> 2) & 0b1)
-            ^ ((self.0 >> 4) & 0b1))
-            & 0b1;
-        let p1 = !(((self.0 >> 1) & 0b1)
-            ^ ((self.0 >> 3) & 0b1)
-            ^ ((self.0 >> 4) & 0b1)
-            ^ ((self.0 >> 5) & 0b1))
-            & 0b1;
-        self.0 = (self.0 & 0x3f) | (p0 << 6) | (p1 << 7);
-    }
-
-    pub fn get_id(&self) -> u8 {
-        self.0 & 0x3f
-    }
-}
-
-pub fn calc_lin_chksum(buf: &[u8], start: u8) -> u8 {
-    let mut chksum: u8 = start;
-    let mut overflow;
-
-    for byte in buf {
-        (chksum, overflow) = chksum.overflowing_add(*byte);
-        if overflow {
-            chksum += 1;
-        }
-    }
-    !chksum
+    schedule_table: LinScheduleTable,
+    next_schedule_index: usize,
 }
 
 impl LinHandler {
@@ -93,8 +49,11 @@ impl LinHandler {
         Self {
             serial,
             config,
+            checksum_mode: LinChecksum::Classic,
             slave_data: [const { Vec::new() }; 64],
             current_pid: None,
+            schedule_table: LinScheduleTable(Vec::new()),
+            next_schedule_index: 0,
         }
     }
 
@@ -112,28 +71,47 @@ impl LinHandler {
         register_block.cr1.modify(|_, w| w.ue().enabled());
     }
 
-    pub fn set_bitrate(&mut self, bitrate: Hertz) {
+    pub fn set_config(&mut self, config: LinChannelConfig) {
         while !self.serial.is_idle() {}
-        self.config.baudrate(bitrate);
+        self.checksum_mode = config.checksum;
+        self.config.baudrate((config.bitrate as u32).Hz());
         self.serial.reconfigure(self.config);
         Self::modify_serial();
     }
 
+    pub fn get_checksum_mode(&self) -> LinChecksum {
+        self.checksum_mode
+    }
+
     pub fn set_slave_data(
         &mut self,
-        id: u8,
+        pid: ProtectedIdentifier,
         mut data: Vec<u8, 9>,
-        calc_chksum: Option<LinChecksum>,
+        calc_checksum: Option<LinChecksum>,
     ) {
-        if calc_chksum.is_some() {
-            let start_value = match calc_chksum {
-                Some(LinChecksum::Enhanced(pid)) => pid.0,
+        if calc_checksum.is_some() && !data.is_empty() {
+            let start_value = match calc_checksum {
+                Some(LinChecksum::Enhanced) => pid.0,
                 None | Some(LinChecksum::Classic) => 0,
             };
             let data_len = data.len();
             data[data_len - 1] = calc_lin_chksum(&data[..data_len - 2], start_value);
         }
-        self.slave_data[id as usize] = data;
+        self.slave_data[pid.get_id() as usize] = data;
+    }
+
+    pub fn set_schedule_table(&mut self, schedule_table: LinScheduleTable) {
+        self.schedule_table = schedule_table;
+        self.next_schedule_index = 0;
+    }
+
+    pub fn next_master_slot(&mut self) -> Option<LinScheduleSlot> {
+        let next_slot = self.schedule_table.0.get(self.next_schedule_index);
+        self.next_schedule_index += 1;
+        if self.next_schedule_index >= self.schedule_table.0.len() {
+            self.next_schedule_index = 0;
+        }
+        next_slot.copied()
     }
 
     pub fn send_master_request(&mut self, pid: ProtectedIdentifier) -> nb::Result<(), Infallible> {
@@ -211,21 +189,31 @@ impl LinHandler {
                     data
                 );
 
+                let (payload_length, payload, checksum) = if data.is_empty() {
+                    (0, Vec::new(), 0)
+                } else {
+                    (
+                        (data.len() as u8) - 1,
+                        Vec::from_slice(&data[..data.len() as usize - 1]).unwrap(),
+                        data[data.len() - 1],
+                    )
+                };
+
                 let mut tecmp_data = TecmpData {
-                    interface_id: INTERFACE_ID.0,
+                    interface_id: LIN_INTERFACE_ID.0,
                     timestamp,
                     length: 0, // Set later
                     data: tecmp_rs::Data::Lin(LinData {
                         flags: LinDataFlags {
-                            parity_err: !current_pid.is_valid(),
+                            parity_err_use_parity: !current_pid.is_valid(),
                             no_slave_response: data.is_empty(),
                             // checksum_err: todo!(),
                             ..Default::default()
                         },
                         lin_id: current_pid.get_id(),
-                        payload_length: (data.len() as u8) - 1,
-                        payload: Vec::from_slice(&data[..data.len() as usize - 1]).unwrap(),
-                        checksum: data[data.len() - 1],
+                        payload_length,
+                        payload,
+                        checksum,
                     }),
                 };
                 tecmp_data.update().unwrap();
@@ -262,6 +250,7 @@ impl LinHandler {
             }
             self.current_pid = Some(pid);
 
+            defmt::trace!("Slave data: {:?}", self.slave_data);
             let slave_data = &self.slave_data[pid.get_id() as usize];
             if !slave_data.is_empty() {
                 defmt::info!(

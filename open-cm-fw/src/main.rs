@@ -15,11 +15,12 @@ static mut DES_RING: MaybeUninit<ethernet::DesRing<ED_NUM, ED_NUM>> = MaybeUnini
 #[rtic::app(device = stm32h7xx_hal::stm32, peripherals = true, dispatchers = [EXTI0, EXTI1])]
 mod app {
     use heapless::Vec;
-    use open_cm_common::tecmp::{CM_LOCAL_MAC_ADDRESS, InterfaceId, TecmpConfig, TecmpEvent};
+    use open_cm_common::lin::{LinConfig, LinScheduleSlot, ProtectedIdentifier};
+    use open_cm_common::tecmp::TecmpConfig;
+    use open_cm_common::tecmp::{CM_LOCAL_MAC_ADDRESS, InterfaceId, TecmpEvent};
     use open_cm_fw::can::CanHandler;
     use open_cm_fw::can::Fifo;
-    use open_cm_fw::lin::LinHandler;
-    use open_cm_fw::lin::ProtectedIdentifier;
+    use open_cm_fw::lin::{LIN_INTERFACE_ID, LinHandler};
     use open_cm_fw::tecmp::TECMP_CHANNEL_SIZE;
     use open_cm_fw::tecmp::TecmpHandler;
     use rtic_monotonics::stm32::prelude::*;
@@ -59,6 +60,8 @@ mod app {
     }
 
     stm32_tim2_monotonic!(Mono, 1_000_000);
+
+    defmt::timestamp!("{}", Mono::now());
 
     #[init]
     fn init(mut ctx: init::Context) -> (SharedResources, LocalResources) {
@@ -203,8 +206,7 @@ mod app {
         // Spawn tasks
         tecmp_sender::spawn(tecmp_r).unwrap();
         tecmp_event_dispatcher::spawn(tecmp_event_r).unwrap();
-        lin_test::spawn().unwrap();
-        lin_set_slave_data::spawn(Vec::from_array([0x1, 0x2, 0x3, 0x4, 0x0])).unwrap();
+        lin_handle_master_schedule::spawn().unwrap();
 
         Mono::start(200_000_000);
 
@@ -238,21 +240,27 @@ mod app {
     }
 
     #[task(shared = [lin], priority = 1)]
-    async fn lin_test(mut ctx: lin_test::Context) {
+    async fn lin_handle_master_schedule(mut ctx: lin_handle_master_schedule::Context) {
+        let mut last_send_instant;
+        let mut next_slot = None;
         loop {
-            Mono::delay(500u64.millis()).await;
-            ctx.shared.lin.lock(|lin| {
-                lin.send_master_request(ProtectedIdentifier::from_id(0x02))
-                    .unwrap()
-            });
+            last_send_instant = Mono::now();
+            if let Some(LinScheduleSlot { pid, delay_ms: _ }) = next_slot {
+                ctx.shared
+                    .lin
+                    .lock(|lin| lin.send_master_request(pid))
+                    .unwrap();
+            }
+            next_slot = ctx.shared.lin.lock(|lin| lin.next_master_slot());
+            if next_slot.is_some() {
+                defmt::info!("Next lin schedule slot: {:?}", next_slot);
+            }
+            if let Some(LinScheduleSlot { pid: _, delay_ms }) = &next_slot {
+                Mono::delay_until(last_send_instant + (*delay_ms as u64).millis()).await;
+            } else {
+                Mono::delay(100_u64.millis()).await;
+            }
         }
-    }
-
-    #[task(shared = [lin], priority = 1)]
-    async fn lin_set_slave_data(mut ctx: lin_set_slave_data::Context, data: Vec<u8, 9>) {
-        ctx.shared
-            .lin
-            .lock(|lin| lin.set_slave_data(0x2, data, Some(open_cm_fw::lin::LinChecksum::Classic)))
     }
 
     #[task(binds = ETH, shared = [tecmp_handler], local = [tecmp_event_sender], priority = 3)]
@@ -275,15 +283,18 @@ mod app {
         }
     }
 
-    #[task(shared = [can1, can2], priority = 1)]
+    #[task(shared = [can1, can2, lin], priority = 1)]
     async fn tecmp_event_dispatcher(
         mut ctx: tecmp_event_dispatcher::Context,
         mut receiver: Receiver<'static, TecmpEvent, TECMP_CHANNEL_SIZE>,
     ) {
         while let Ok(event) = receiver.recv().await {
+            defmt::info!("Receiver: got tecmp event");
+            defmt::debug!("event: {:?}", event);
             match event {
                 TecmpEvent::Data(data) => {
                     defmt::info!("Receiver: got tecmp data");
+                    defmt::debug!("data: {:?}", data);
                     ctx.shared.can1.lock(|can| {
                         if can.interface_id.0 == data.interface_id
                             && !can.transmit_tecmp_data(&data)
@@ -304,23 +315,57 @@ mod app {
                             );
                         }
                     });
-                }
-                TecmpEvent::Config(config) => match config {
-                    TecmpConfig::Can(can_channel_config) => {
-                        defmt::info!("Receiver: got can channel config: {:?}", can_channel_config);
-
-                        ctx.shared.can1.lock(|can| {
-                            if can.interface_id == can_channel_config.interface_id {
-                                can.configure(can_channel_config);
+                    if let tecmp_rs::Data::Lin(lin_data) = data.data
+                        && LIN_INTERFACE_ID.0 == data.interface_id
+                    {
+                        ctx.shared.lin.lock(|lin| {
+                            let pid = if lin_data.flags.parity_err_use_parity {
+                                ProtectedIdentifier(lin_data.lin_id)
+                            } else {
+                                ProtectedIdentifier::from_id(lin_data.lin_id)
+                            };
+                            let mut payload = Vec::from_slice(&lin_data.payload).unwrap();
+                            if !payload.is_empty() {
+                                payload.push(lin_data.checksum).unwrap();
                             }
-                        });
-                        ctx.shared.can2.lock(|can| {
-                            if can.interface_id == can_channel_config.interface_id {
-                                can.configure(can_channel_config);
-                            }
+                            let checksum_mode = lin.get_checksum_mode();
+                            lin.set_slave_data(
+                                pid,
+                                payload,
+                                if lin_data.flags.checksum_err_use_checksum {
+                                    None
+                                } else {
+                                    Some(checksum_mode)
+                                },
+                            );
                         });
                     }
-                },
+                }
+                TecmpEvent::Config(config) => {
+                    defmt::info!("Got config: {:?}", config);
+                    match config {
+                        TecmpConfig::Can(can_channel_config) => {
+                            ctx.shared.can1.lock(|can| {
+                                if can.interface_id == can_channel_config.interface_id {
+                                    can.configure(can_channel_config);
+                                }
+                            });
+                            ctx.shared.can2.lock(|can| {
+                                if can.interface_id == can_channel_config.interface_id {
+                                    can.configure(can_channel_config);
+                                }
+                            });
+                        }
+                        TecmpConfig::Lin(lin_config) => {
+                            ctx.shared.lin.lock(|lin| match lin_config {
+                                LinConfig::Config(lin_config) => lin.set_config(lin_config),
+                                LinConfig::ScheduleTable(schedule_table) => {
+                                    lin.set_schedule_table(schedule_table)
+                                }
+                            })
+                        }
+                    }
+                }
             }
         }
     }
