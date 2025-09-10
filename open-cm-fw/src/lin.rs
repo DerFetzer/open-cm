@@ -30,7 +30,7 @@ pub struct LinHandler {
     config: Config,
     checksum_mode: LinChecksum,
     slave_data: [Vec<u8, 9>; 64],
-    current_pid: Option<ProtectedIdentifier>,
+    current_frame: Option<(ProtectedIdentifier, u64)>,
     schedule_table: LinScheduleTable,
     next_schedule_index: usize,
 }
@@ -51,7 +51,7 @@ impl LinHandler {
             config,
             checksum_mode: LinChecksum::Classic,
             slave_data: [const { Vec::new() }; 64],
-            current_pid: None,
+            current_frame: None,
             schedule_table: LinScheduleTable(Vec::new()),
             next_schedule_index: 0,
         }
@@ -141,7 +141,7 @@ impl LinHandler {
             registers.icr.write(|w| w.rtocf().set_bit());
             registers.cr1.modify(|_, w| w.rtoie().clear_bit());
 
-            if let Some(current_pid) = self.current_pid.take() {
+            if let Some(current_pid) = self.current_frame.take() {
                 defmt::warn!(
                     "Break detected during waiting for bytes for id {:#x}",
                     current_pid
@@ -161,7 +161,6 @@ impl LinHandler {
 
     pub fn handle_receiver_timeout(
         &mut self,
-        timestamp: u64,
         tecmp_s: &mut Sender<'static, TecmpData, TECMP_CHANNEL_SIZE>,
     ) -> nb::Result<u8, serial::Error> {
         let registers = unsafe { &*UART7::ptr() };
@@ -172,7 +171,7 @@ impl LinHandler {
             registers.icr.write(|w| w.rtocf().set_bit());
             registers.cr1.modify(|_, w| w.rtoie().clear_bit());
 
-            if let Some(current_pid) = self.current_pid.take() {
+            if let Some((current_pid, timestamp)) = self.current_frame.take() {
                 // Read receive FIFO
                 let mut rx: Rx<UART7> = unsafe { core::mem::zeroed() };
 
@@ -227,7 +226,7 @@ impl LinHandler {
         Ok(0)
     }
 
-    pub fn handle_rx_fifo_threshold(&mut self) -> nb::Result<(), Infallible> {
+    pub fn handle_rx_fifo_threshold(&mut self, timestamp: u64) -> nb::Result<(), Infallible> {
         let registers = unsafe { &*UART7::ptr() };
         if registers.isr.read().rxft().bit_is_set() && registers.cr3.read().rxftie().bit_is_set() {
             defmt::info!("Received 2 bytes in serial FIFO");
@@ -248,7 +247,7 @@ impl LinHandler {
                 defmt::warn!("Invalid sync value: {:#x}", sync);
                 return Ok(());
             }
-            self.current_pid = Some(pid);
+            self.current_frame = Some((pid, timestamp));
 
             defmt::trace!("Slave data: {:?}", self.slave_data);
             let slave_data = &self.slave_data[pid.get_id() as usize];

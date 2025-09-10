@@ -394,9 +394,9 @@ mod app {
         let tecmp_sender = ctx.local.tecmp_sender_lin;
         ctx.shared.lin.lock(|lin| {
             lin.handle_break_detected();
-            lin.handle_rx_fifo_threshold().unwrap();
-            lin.handle_receiver_timeout(Mono::now().ticks() * 1000, tecmp_sender)
+            lin.handle_rx_fifo_threshold(Mono::now().ticks() * 1000)
                 .unwrap();
+            lin.handle_receiver_timeout(tecmp_sender).unwrap();
         });
     }
 }
