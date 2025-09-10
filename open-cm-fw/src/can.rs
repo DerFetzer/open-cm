@@ -4,7 +4,7 @@ use fdcan::{
     BusMonitoringMode, ConfigMode, FdCan, Instance, NormalOperationMode, PoweredDownMode,
     config::{
         DataBitTiming, FrameTransmissionConfig, Interrupt, InterruptLine, Interrupts,
-        NominalBitTiming,
+        NominalBitTiming, TimestampSource,
     },
     filter::{ExtendedFilter, StandardFilter},
     frame::{FrameFormat, RxFrameInfo, TxFrameHeader},
@@ -121,9 +121,13 @@ impl<I: Instance> CanHandler<I> {
         }
         can.set_automatic_retransmit(false);
         can.set_frame_transmit(FrameTransmissionConfig::AllowFdCanAndBRS);
+        can.set_timestamp_counter_source(TimestampSource::FromTIM3);
 
         can.enable_interrupt_line(InterruptLine::_0, true);
-        can.enable_interrupts(Interrupts::all());
+        can.enable_interrupt(Interrupt::RxFifo0NewMsg);
+        can.enable_interrupt(Interrupt::RxFifo1NewMsg);
+        can.enable_interrupt(Interrupt::ProtErrData);
+        can.enable_interrupt(Interrupt::ProtErrArbritation);
 
         Self {
             state_wrapper: CanStateWrapper::Config(can),
@@ -197,7 +201,7 @@ impl<I: Instance> CanHandler<I> {
             tecmp_rs::Data::CanFd(can_fd_data) => (
                 TxFrameHeader {
                     len: can_fd_data.payload_length,
-                    frame_format: FrameFormat::Standard,
+                    frame_format: FrameFormat::Fdcan,
                     id: if can_fd_data.flags.ide || can_fd_data.can_id & (1 << 31) != 0 {
                         Id::Extended(unsafe {
                             ExtendedId::new_unchecked(can_fd_data.can_id & 0x3FFF_FFFF)
@@ -259,6 +263,14 @@ impl<I: Instance> CanHandler<I> {
             defmt::info!("{} has new message(s)", self.interface_id);
             let mut buf = [0; 64];
             while let Some(header) = self.receive(&mut buf) {
+                let timestamp_diff =
+                    (((timestamp / 1000) & 0xffff) as u16).wrapping_sub(header.time_stamp);
+                defmt::info!(
+                    "Received frame with timestamp={} and diff={}",
+                    header.time_stamp,
+                    timestamp_diff
+                );
+                let timestamp = timestamp - timestamp_diff as u64;
                 let mut tecmp_data = TecmpData {
                     interface_id: self.interface_id.0,
                     timestamp,

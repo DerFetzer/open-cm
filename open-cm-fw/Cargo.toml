@@ -27,7 +27,7 @@ fdcan = "0.2.1"
 heapless = { version = "0.9.1", features = ["defmt"] }
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 rtic = { version = "2.2.0", features = ["thumbv7-backend"] }
-rtic-monotonics = { version = "2.1.0", features = ["stm32h735ig", "stm32_tim2", "defmt"] }
+rtic-monotonics = { version = "2.1.0", features = ["stm32h735ig", "stm32_tim3", "defmt"] }
 rtic-sync = "1.4.0"
 semihosting = "0.1.20"
 serde = { version = "1.0.219", default-features = false, features = ["derive"] }

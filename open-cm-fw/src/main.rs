@@ -59,7 +59,7 @@ mod app {
         tecmp_event_sender: Sender<'static, TecmpEvent, TECMP_CHANNEL_SIZE>,
     }
 
-    stm32_tim2_monotonic!(Mono, 1_000_000);
+    stm32_tim3_monotonic!(Mono, 1_000_000);
 
     defmt::timestamp!("{}", Mono::now());
 
